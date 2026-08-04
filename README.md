@@ -28,14 +28,14 @@ aggregate returns `{:from :statistics :read 0}`.
 
 ## What it decodes, and what it refuses by name
 
-Supported: codecs `UNCOMPRESSED` and **`SNAPPY`**; encodings `PLAIN`,
+Supported: codecs `UNCOMPRESSED`, **`SNAPPY`** and **`GZIP`**; encodings `PLAIN`,
 **`PLAIN_DICTIONARY`** and **`RLE_DICTIONARY`**; v1 `DATA_PAGE`; flat schemas;
 `REQUIRED` and `OPTIONAL`; `INT32` / `INT64` / `DOUBLE` / `BYTE_ARRAY`.
 
 That set is **what pyarrow writes by default**, so most real files are now
 readable rather than only prunable.
 
-Everything else throws with what it met — gzip / zstd / brotli / lz4, delta
+Everything else throws with what it met — zstd / brotli / lz4, delta
 encodings, byte-stream-split, v2 data pages, repeated (nested) columns. **A
 decoder that guesses at an encoding produces plausible numbers**, and
 plausible numbers from a file nobody re-checks is the worst failure this
@@ -66,7 +66,16 @@ fixture is what kept "statistics work on files this reader cannot decode"
 under test instead of quietly losing its only witness — the refusal tests had
 been passing against a file that had just become decodable.
 
-It is DELTA_BINARY_PACKED and not gzip, though gzip was the obvious choice:
+gzip is decoded through **`kotoba-lang/org-ietf-deflate`** — Huffman + LZ77 by
+hand in portable `.cljc`, verifying CRC-32 and ISIZE. `java.util.zip` and
+Node's `zlib` would each work on exactly one of the runtimes this reader has
+to keep running on, and a second inflate in this workspace would be a second
+one to get wrong. `gzip.parquet` is asserted to decode value-for-value
+identical to `plain.parquet`, and is **excluded from the byte-determinism
+gate** for the reason below.
+
+The unsupported fixture is DELTA_BINARY_PACKED and not gzip, though gzip was
+the obvious choice:
 **gzip byte-equality is not a property that holds across environments.**
 Deflate output is implementation-dependent, so the generator produced
 identical bytes on repeated local runs and different bytes on CI. The

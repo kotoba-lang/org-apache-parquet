@@ -7,12 +7,13 @@
   nobody can re-check is the worst failure available to this library — worse
   than not reading the file, because it is silent.
 
-  Supported: `UNCOMPRESSED` and `SNAPPY` codecs; `PLAIN`, `PLAIN_DICTIONARY`
+  Supported: `UNCOMPRESSED`, `SNAPPY` and `GZIP` codecs; `PLAIN`, `PLAIN_DICTIONARY`
   and `RLE_DICTIONARY` encodings; `DATA_PAGE` (v1); flat schemas; `REQUIRED`
-  and `OPTIONAL` columns. Not supported, by name: gzip / zstd / brotli / lz4,
+  and `OPTIONAL` columns. Not supported, by name: zstd / brotli / lz4,
   delta encodings, byte-stream-split, v2 data pages, and repeated (nested)
   columns."
-  (:require [parquet.snappy :as snappy]
+  (:require [deflate.core :as deflate]
+            [parquet.snappy :as snappy]
             [parquet.thrift :as th]))
 
 (defn decompress
@@ -25,10 +26,20 @@
   (case codec
     :uncompressed (subvec (vec bs) start end)
     :snappy (snappy/decompress bs start end uncompressed-size)
+    ;; `org-ietf-deflate` rather than a second inflate here: Huffman + LZ77 by
+    ;; hand in portable .cljc, verifying CRC-32 and ISIZE. java.util.zip and
+    ;; Node's zlib would each work on exactly one of the runtimes this reader
+    ;; has to keep running on.
+    :gzip (let [out (deflate/gunzip (subvec (vec bs) start end))]
+            (when (and uncompressed-size (not= (long uncompressed-size) (count out)))
+              (throw (ex-info "gzip output is not the length the page header declared"
+                              {:type :parquet/codec-length-mismatch
+                               :header uncompressed-size :actual (count out)})))
+            (vec out))
     (throw (ex-info (str "parquet: unsupported codec " (pr-str codec)
                          " — statistics are still readable from this file")
                     {:type :parquet/unsupported :codec codec
-                     :supported [:uncompressed :snappy]}))))
+                     :supported [:uncompressed :snappy :gzip]}))))
 
 (def ^:private le th/le-uint)
 
@@ -179,7 +190,7 @@
                          (recur (inc i) vs (conj out nil)))))
            :valid valid})))))
 
-(def supported-codecs #{:uncompressed :snappy})
+(def supported-codecs #{:uncompressed :snappy :gzip})
 (def supported-encodings
   (into #{:plain :rle :bit-packed} dictionary-encodings))
 
