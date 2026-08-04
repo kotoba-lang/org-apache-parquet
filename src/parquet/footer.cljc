@@ -12,7 +12,8 @@
   curiosity: it means chunk pruning, `count`, `min` and `max` work on files
   `read-column` refuses. `parquet.source` leans on it, and there is a fixture
   written with snappy + dictionary specifically to hold that line."
-  (:require [parquet.thrift :as th]))
+  (:require [parquet.bytes :as pbytes]
+            [parquet.thrift :as th]))
 
 (def magic [0x50 0x41 0x52 0x31]) ; "PAR1"
 
@@ -35,26 +36,28 @@
 (defn- le32 [bs i] (th/le-uint bs i 4))
 
 (defn footer-span
-  "`[start length]` of the FileMetaData struct within `bs`.
+  "`[start length]` of the FileMetaData struct, from the file's last 8 bytes.
 
-  Validates BOTH magic markers. A file whose trailing magic is right and
-  whose leading magic is not has been truncated at the front or is not a
-  Parquet file at all, and reading its footer would produce plausible
-  nonsense."
-  [bs]
-  (let [n (count bs)]
+  Reads the tail and the leading magic — 12 bytes total — rather than the
+  file. Both magic markers are checked: a file whose trailing magic is right
+  and whose leading magic is not has been truncated at the front or is not
+  Parquet at all, and its footer would decode to plausible nonsense."
+  [src]
+  (let [src (pbytes/source src)
+        n (-> src pbytes/-size long)]
     (when (< n 12)
       (throw (ex-info "too short to be a Parquet file" {:type :parquet/not-parquet :size n})))
-    (when-not (= magic (vec (subvec (vec bs) 0 4)))
+    (when-not (= magic (vec (pbytes/-read-range src 0 4)))
       (throw (ex-info "missing leading PAR1" {:type :parquet/not-parquet})))
-    (when-not (= magic (vec (subvec (vec bs) (- n 4) n)))
-      (throw (ex-info "missing trailing PAR1" {:type :parquet/not-parquet})))
-    (let [len (long (le32 bs (- n 8)))
-          start (- n 8 len)]
-      (when (or (neg? start) (< start 4))
-        (throw (ex-info "footer length points outside the file"
-                        {:type :parquet/malformed :footer-length len :size n})))
-      [start len])))
+    (let [tail (vec (pbytes/-read-range src (- n 8) n))]
+      (when-not (= magic (subvec tail 4 8))
+        (throw (ex-info "missing trailing PAR1" {:type :parquet/not-parquet})))
+      (let [len (long (le32 tail 0))
+            start (- n 8 len)]
+        (when (or (neg? start) (< start 4))
+          (throw (ex-info "footer length points outside the file"
+                          {:type :parquet/malformed :footer-length len :size n})))
+        [start len]))))
 
 (defn- statistics
   "Bounds a caller may prune with, or fewer of them.
@@ -82,12 +85,11 @@
           ;; 5/6 are max_value/min_value; 1/2 are the deprecated max/min. Prefer
           ;; the former: the deprecated pair was written with a signed-comparison
           ;; bug for BYTE_ARRAY that the newer fields exist to escape.
-          maxb (or (get m 5) (get m 1))
-          minb (or (get m 6) (get m 2))]
-      (let [mn (some-> minb decode) mx (some-> maxb decode)]
-        (cond-> {:nulls (long (or (get m 3) 0))}
-          (some? mn) (assoc :min mn)
-          (some? mx) (assoc :max mx))))))
+          mx (some-> (or (get m 5) (get m 1)) decode)
+          mn (some-> (or (get m 6) (get m 2)) decode)]
+      (cond-> {:nulls (long (or (get m 3) 0))}
+        (some? mn) (assoc :min mn)
+        (some? mx) (assoc :max mx)))))
 
 (defn- column-metadata [m]
   (let [physical (physical-types (get m 1))]
@@ -112,14 +114,23 @@
     (get m 5) (assoc :num-children (long (get m 5)))))
 
 (defn parse
-  "Decode the footer of the whole file `bs` (a vector of unsigned ints).
+  "Decode the footer of `src` (an `IByteSource`, or a whole-file vector).
 
   -> `{:version :num-rows :created-by :schema [..] :row-groups [..]}`.
   The first schema element is the root and carries no type; the leaf elements
-  after it are the columns, in the order chunks appear."
-  [bs]
-  (let [[start _] (footer-span bs)
-        m (th/parse-struct bs start)
+  after it are the columns, in the order chunks appear.
+
+  Two ranges are read: the 12 bytes that locate the footer, and the footer
+  itself. Nothing else in the file is touched, whatever its size."
+  [src]
+  (let [src (pbytes/source src)
+        [start len] (footer-span src)
+        ;; Indexed from 0 within the fetched window. Absolute-to-relative
+        ;; translation happens here and at the page read, and nowhere else --
+        ;; the thrift decoder never learns that the file is bigger than what
+        ;; it was handed.
+        window (vec (pbytes/-read-range src start (+ start len)))
+        m (th/parse-struct window 0)
         schema (mapv schema-element (get m 2))]
     {:version (some-> (get m 1) long)
      :num-rows (long (get m 3))

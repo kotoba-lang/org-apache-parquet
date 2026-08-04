@@ -74,6 +74,40 @@ python3 -m venv .venv && .venv/bin/pip install pyarrow
 .venv/bin/python test/fixtures/generate.py
 ```
 
+## It reads ranges, not files
+
+An earlier version of this reader took the whole file as a vector. It was
+correct, and it threw away the point: Parquet exists so a query reads a footer
+and two column chunks instead of forty gigabytes.
+
+`parquet.bytes/IByteSource` answers ranges, and every read goes through it:
+
+| operation | what is fetched |
+|---|---|
+| `open` | leading magic (4 B), the tail (8 B), and the footer — **no data pages, at any file size** |
+| `-chunk-stats` | nothing; a lookup in what `open` already parsed |
+| `-read-column` | exactly `total_compressed_size` for that one chunk, at its `data_page_offset` |
+| a refused chunk | **nothing** — `check-readable!` runs before the fetch |
+
+`parquet.bytes/counting` records every range, and the tests assert on bytes
+fetched rather than on answers: a scan that pruned two of three row groups and
+one that read all three return the same rows, so only the byte accounting can
+tell them apart.
+
+On the checked-in fixture the numbers are unflattering — 1,534 bytes to open a
+2,427-byte file, because a footer costs roughly the same whether it describes
+nine rows or nine billion. That is the shape of the win, not a counterexample
+to it: footer size is O(row groups × columns) and data is O(rows), so the
+fraction collapses on any file worth ranging. What the tests pin is the
+structural claim — opening never touches a data page, and a column read
+fetches that chunk's own size and no more.
+
+`prefetched` is for hosts where a range fetch is asynchronous (a Worker doing
+HTTP Range): fetch the ranges `footer-ranges` names, hand them back, parse
+without the file. The seam is synchronous because `columnar/IColumnSource` is,
+and an async rewrite of the engine is a bigger decision than this repo should
+make on its own.
+
 ## Layout
 
 | ns | what |
@@ -81,6 +115,7 @@ python3 -m venv .venv && .venv/bin/pip install pyarrow
 | `parquet.thrift` | Thrift **compact protocol** decoder — Parquet metadata is written in it, so nothing is readable until this is. Self-contained byte grammar, no Parquet concepts. |
 | `parquet.footer` | `FileMetaData`: schema, row groups, column chunks, statistics. Two range reads locate everything about a file of any size. |
 | `parquet.decode` | Definition levels (RLE / bit-packing hybrid) and PLAIN values. |
+| `parquet.bytes` | The byte-range seam: `IByteSource`, plus `counting` and `prefetched`. |
 | `parquet.source` | The `IColumnSource`. |
 
 ## Test

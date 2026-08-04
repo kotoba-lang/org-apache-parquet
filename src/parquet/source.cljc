@@ -14,6 +14,7 @@
   partially useful and one that is useless until complete."
   (:require [columnar.source :as csrc]
             [columnar.vector :as cvec]
+            [parquet.bytes :as pbytes]
             [parquet.decode :as decode]
             [parquet.footer :as footer]))
 
@@ -42,13 +43,17 @@
       0)))
 
 (defn open
-  "A `columnar/IColumnSource` over the whole file `bs` (a vector of unsigned
-  ints — the caller decides how the bytes arrived).
+  "A `columnar/IColumnSource` over `src` — a `parquet.bytes/IByteSource`, or a
+  vector for a file already in memory.
 
-  The footer is parsed once, here. Every later `-chunk-stats` is a lookup in
-  what was already read."
-  [bs]
-  (let [meta (footer/parse bs)]
+  The footer is parsed once, here, from two ranges. Every later
+  `-chunk-stats` is a lookup in what that returned, so pruning an object costs
+  the footer and nothing more however large the object is. `-read-column`
+  fetches exactly one column chunk: its offset and compressed size are both in
+  the metadata, so the range is known before the request is made."
+  [src]
+  (let [src (pbytes/source src)
+        meta (footer/parse src)]
     (reify csrc/IColumnSource
       (-schema [_] (:columns meta))
       (-chunk-count [_] (count (:row-groups meta)))
@@ -62,17 +67,25 @@
             (merge {:rows num-values} statistics))))
       (-read-column [_ chunk column]
         (let [cm (chunk-meta meta chunk column)]
+          ;; Before any byte is fetched: a refusal must not cost a download.
           (decode/check-readable! cm)
-          (let [[header body] (footer/page-header bs (:data-page-offset cm))]
+          (let [start (:data-page-offset cm)
+                ;; The chunk's own compressed size, from the footer. This is
+                ;; what makes the range exact rather than a guess with a
+                ;; safety margin.
+                window (vec (pbytes/-read-range
+                             src start (min (pbytes/-size src)
+                                            (+ start (:total-compressed-size cm)))))
+                [header body] (footer/page-header window 0)]
             (when-not (= :data-page (:type header))
               (throw (ex-info (str "unsupported first page type " (pr-str (:type header)))
                               {:type :parquet/unsupported :page (:type header)})))
             (let [{:keys [values valid]}
-                  (decode/data-page bs body header (:type cm) (max-def-level meta column))]
+                  (decode/data-page window body header (:type cm) (max-def-level meta column))]
               (cvec/of (:type cm) values valid))))))))
 
 (defn metadata
   "The parsed footer, for callers that want the schema or the row-group map
   without going through the column source."
-  [bs]
-  (footer/parse bs))
+  [src]
+  (footer/parse src))

@@ -10,6 +10,7 @@
             [columnar.plan :as plan]
             [columnar.source :as csrc]
             [columnar.vector :as cvec]
+            [parquet.bytes :as pbytes]
             [parquet.footer :as footer]
             [parquet.source :as psrc]
             #?(:clj [clojure.java.io :as io])))
@@ -142,3 +143,63 @@
            (is (= :parquet/precision-unavailable (:type (ex-data e)))
                "ClojureScript numbers are doubles; returning a rounded value
                 would be a wrong answer nothing downstream could detect"))))))
+
+;; ── the reader must not need the whole file ─────────────────────────────────
+
+(deftest reading-one-column-fetches-one-column-chunk
+  (let [file @plain
+        size (count file)
+        c (pbytes/counting (pbytes/of-vector file))
+        s (psrc/open (:source c))
+        after-open (:bytes (pbytes/read-counts c))
+        m (psrc/metadata file)
+        chunk (first (:columns (first (:row-groups m))))]
+    (testing "opening reads the footer, not the file"
+      (is (< after-open size) "the whole file was read to open it")
+      (is (= 3 (count (:ranges (pbytes/read-counts c))))
+          "leading magic, the 8-byte tail, and the footer — nothing else"))
+    (testing "a column read fetches exactly that chunk's compressed bytes"
+      (csrc/-read-column s 0 "price")
+      (let [{:keys [bytes ranges]} (pbytes/read-counts c)]
+        (is (= (:total-compressed-size chunk) (- bytes after-open))
+            "the range is the chunk's own size from the footer, not a guess
+             with a safety margin")
+        (is (= [(:data-page-offset chunk)
+                (+ (:data-page-offset chunk) (:total-compressed-size chunk))]
+               (last ranges)))))
+    (testing "and the pruned row groups are never fetched at all"
+      (let [c2 (pbytes/counting (pbytes/of-vector file))
+            src (csrc/counting (psrc/open (:source c2)))
+            before (:bytes (pbytes/read-counts c2))]
+        (plan/scan (:source src) {:columns ["price"] :predicates [[:= "price" 120]]})
+        (is (= #{1} (:chunks (csrc/read-counts src))))
+        (is (= (:total-compressed-size
+                (first (:columns (second (:row-groups m)))))
+               (- (:bytes (pbytes/read-counts c2)) before))
+            "one chunk's worth of bytes for a query over three row groups")))))
+
+(deftest a-refusal-costs-no-bytes
+  (let [c (pbytes/counting (pbytes/of-vector @dict-snappy))
+        s (psrc/open (:source c))
+        after-open (:bytes (pbytes/read-counts c))]
+    (is (thrown? #?(:clj Exception :cljs :default) (csrc/-read-column s 0 "price")))
+    (is (= after-open (:bytes (pbytes/read-counts c)))
+        "check-readable! runs before the fetch, so an unsupported codec is
+         discovered from metadata rather than paid for in transfer")))
+
+(deftest an-async-host-can-prefetch-what-the-footer-needs
+  (let [file @plain
+        size (count file)
+        {:keys [tail]} (pbytes/footer-ranges size)]
+    (is (= [(- size 8) size] tail))
+    (testing "fetch the declared ranges, hand them back, parse without the file"
+      (let [tail-bytes (subvec file (first tail) (second tail))
+            len (+ (nth tail-bytes 0) (* 256 (nth tail-bytes 1)))
+            start (- size 8 len)
+            src (pbytes/prefetched size [[0 (subvec file 0 4)]
+                                         [start (subvec file start size)]])]
+        (is (= 9 (:num-rows (psrc/metadata src)))))))
+  (testing "a range nobody prefetched is refused, not silently short"
+    (let [src (pbytes/prefetched 100 [[0 [1 2 3]]])]
+      (is (thrown? #?(:clj Exception :cljs :default)
+                   (pbytes/-read-range src 50 60))))))
