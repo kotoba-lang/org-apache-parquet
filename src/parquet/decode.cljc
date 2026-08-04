@@ -7,11 +7,28 @@
   nobody can re-check is the worst failure available to this library — worse
   than not reading the file, because it is silent.
 
-  Supported: `UNCOMPRESSED` codec, `PLAIN` encoding, `DATA_PAGE` (v1), flat
-  schemas, `REQUIRED` and `OPTIONAL` columns. Not supported, by name:
-  dictionary encodings, delta encodings, byte-stream-split, v2 data pages,
-  every compression codec, and repeated (nested) columns."
-  (:require [parquet.thrift :as th]))
+  Supported: `UNCOMPRESSED` and `SNAPPY` codecs; `PLAIN`, `PLAIN_DICTIONARY`
+  and `RLE_DICTIONARY` encodings; `DATA_PAGE` (v1); flat schemas; `REQUIRED`
+  and `OPTIONAL` columns. Not supported, by name: gzip / zstd / brotli / lz4,
+  delta encodings, byte-stream-split, v2 data pages, and repeated (nested)
+  columns."
+  (:require [parquet.snappy :as snappy]
+            [parquet.thrift :as th]))
+
+(defn decompress
+  "A page body, whatever codec it arrived in.
+
+  `:uncompressed` returns the slice untouched rather than copying it through
+  a no-op codec path, because the common case should not pay for the general
+  one."
+  [codec bs start end uncompressed-size]
+  (case codec
+    :uncompressed (subvec (vec bs) start end)
+    :snappy (snappy/decompress bs start end uncompressed-size)
+    (throw (ex-info (str "parquet: unsupported codec " (pr-str codec)
+                         " — statistics are still readable from this file")
+                    {:type :parquet/unsupported :codec codec
+                     :supported [:uncompressed :snappy]}))))
 
 (def ^:private le th/le-uint)
 
@@ -83,51 +100,97 @@
                        " — statistics are still readable from this file")
                   (merge {:type :parquet/unsupported what value} extra))))
 
+(def dictionary-encodings
+  "Both spellings. `PLAIN_DICTIONARY` is the v1 name and `RLE_DICTIONARY` the
+  v2 one; the data pages are identical, so refusing one and accepting the
+  other would reject files for the writer's vintage rather than their
+  contents."
+  #{:plain-dictionary :rle-dictionary})
+
+(defn dictionary-page
+  "PLAIN-decode a dictionary page body into the vector data pages index into."
+  [bs start {:keys [num-values encoding]} physical]
+  (when-not (or (= :plain encoding) (dictionary-encodings encoding))
+    (refuse! :dictionary-encoding encoding {:supported [:plain]}))
+  (plain-values bs start num-values physical))
+
+(defn- values-section
+  "Values for the present rows, from a page's value section.
+
+  PLAIN writes them out; a dictionary page writes indices — one leading byte
+  of bit width, then the RLE/bit-packing hybrid running to the end of the
+  page. There is no length prefix on the indices, which is why `end` has to
+  be threaded here rather than inferred."
+  [bs start end n physical encoding dictionary]
+  (cond
+    (= :plain encoding) (plain-values bs start n physical)
+
+    (dictionary-encodings encoding)
+    (do
+      (when-not dictionary
+        (refuse! :encoding encoding
+                 {:reason :no-dictionary-page
+                  :detail "a dictionary-encoded page without a dictionary is
+                           not decodable; indices would be read as values"}))
+      (let [width (nth bs start)]
+        (mapv (fn [ix]
+                (when-not (< -1 ix (count dictionary))
+                  (throw (ex-info "dictionary index out of range"
+                                  {:type :parquet/malformed :index ix
+                                   :size (count dictionary)})))
+                (nth dictionary ix))
+              (take n (rle-hybrid bs (inc start) end width n)))))
+
+    :else (refuse! :encoding encoding {:supported [:plain :rle-dictionary]})))
+
 (defn data-page
   "Decode one v1 DATA_PAGE into `{:values [..] :valid [..]}`.
 
   `max-def-level` is 1 for an OPTIONAL flat column and 0 for a REQUIRED one.
   A value is present exactly when its definition level equals the maximum;
-  PLAIN values are written only for the present rows, which is why the levels
-  have to be decoded first even to know how many values to read."
-  [bs body-start {:keys [num-values encoding definition-level-encoding]} physical max-def-level]
-  (when-not (= :plain encoding)
-    (refuse! :encoding encoding {:supported [:plain]}))
-  (if (zero? max-def-level)
-    {:values (plain-values bs body-start num-values physical)
-     :valid (vec (repeat num-values true))}
-    (do
-      (when-not (contains? #{:rle :bit-packed} definition-level-encoding)
-        (refuse! :definition-level-encoding definition-level-encoding {}))
-      (let [;; v1 pages prefix the levels section with its byte length as a
-            ;; 4-byte LE int, which is what makes the values' start findable
-            ;; without decoding the levels first.
-            len (long (le bs body-start 4))
-            levels-start (+ body-start 4)
-            levels (take num-values
-                         (rle-hybrid bs levels-start (+ levels-start len)
-                                     (bit-width max-def-level) num-values))
-            valid (mapv #(= % max-def-level) levels)
-            present (count (filter true? valid))
-            vs (plain-values bs (+ levels-start len) present physical)]
-        {:values (loop [i 0 vs vs out []]
-                   (if (= i (count valid))
-                     out
-                     (if (nth valid i)
-                       (recur (inc i) (rest vs) (conj out (first vs)))
-                       (recur (inc i) vs (conj out nil)))))
-         :valid valid}))))
+  values are written only for the present rows, which is why the levels have
+  to be decoded first even to know how many to read."
+  [bs body-start {:keys [num-values encoding definition-level-encoding]}
+   physical max-def-level dictionary]
+  (let [end (count bs)]
+    (if (zero? max-def-level)
+      {:values (values-section bs body-start end num-values physical encoding dictionary)
+       :valid (vec (repeat num-values true))}
+      (do
+        (when-not (contains? #{:rle :bit-packed} definition-level-encoding)
+          (refuse! :definition-level-encoding definition-level-encoding {}))
+        (let [;; v1 pages prefix the levels section with its byte length as a
+              ;; 4-byte LE int, which is what makes the values' start findable
+              ;; without decoding the levels first.
+              len (long (le bs body-start 4))
+              levels-start (+ body-start 4)
+              levels (take num-values
+                           (rle-hybrid bs levels-start (+ levels-start len)
+                                       (bit-width max-def-level) num-values))
+              valid (mapv #(= % max-def-level) levels)
+              present (count (filter true? valid))
+              vs (values-section bs (+ levels-start len) end present physical
+                                 encoding dictionary)]
+          {:values (loop [i 0 vs vs out []]
+                     (if (= i (count valid))
+                       out
+                       (if (nth valid i)
+                         (recur (inc i) (rest vs) (conj out (first vs)))
+                         (recur (inc i) vs (conj out nil)))))
+           :valid valid})))))
+
+(def supported-codecs #{:uncompressed :snappy})
+(def supported-encodings
+  (into #{:plain :rle :bit-packed} dictionary-encodings))
 
 (defn check-readable!
   "Throw unless this column chunk is inside the supported subset.
 
   Called before any byte of the chunk is fetched, so a refusal costs one
   metadata lookup rather than a download."
-  [{:keys [codec encodings dictionary-page-offset path]}]
-  (when-not (= :uncompressed codec)
-    (refuse! :codec codec {:column path :supported [:uncompressed]}))
-  (when dictionary-page-offset
-    (refuse! :encoding :dictionary {:column path}))
-  (when-let [bad (seq (remove #{:plain :rle :bit-packed} encodings))]
-    (refuse! :encoding (vec bad) {:column path :supported [:plain]}))
+  [{:keys [codec encodings path]}]
+  (when-not (supported-codecs codec)
+    (refuse! :codec codec {:column path :supported (vec supported-codecs)}))
+  (when-let [bad (seq (remove supported-encodings encodings))]
+    (refuse! :encoding (vec bad) {:column path :supported (vec supported-encodings)}))
   true)

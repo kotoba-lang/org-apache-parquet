@@ -144,12 +144,15 @@
   where the page's (possibly compressed) body begins."
   [bs i]
   (let [[m i'] (th/parse-struct-with-end bs i)
-        dp (get m 5)]
+        dp (get m 5)
+        dict (get m 7)]
     [(cond-> {:type (page-types (get m 1))
               :uncompressed-size (long (get m 2))
               :compressed-size (long (get m 3))}
        dp (assoc :num-values (long (get dp 1))
                  :encoding (encodings (get dp 2))
                  :definition-level-encoding (encodings (get dp 3))
-                 :repetition-level-encoding (encodings (get dp 4))))
+                 :repetition-level-encoding (encodings (get dp 4)))
+       dict (assoc :num-values (long (get dict 1))
+                   :encoding (encodings (get dict 2))))
      i']))

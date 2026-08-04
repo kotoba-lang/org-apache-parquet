@@ -28,14 +28,42 @@ aggregate returns `{:from :statistics :read 0}`.
 
 ## What it decodes, and what it refuses by name
 
-Supported: `UNCOMPRESSED`, `PLAIN`, v1 `DATA_PAGE`, flat schemas, `REQUIRED`
-and `OPTIONAL` columns, `INT32` / `INT64` / `DOUBLE` / `BYTE_ARRAY`.
+Supported: codecs `UNCOMPRESSED` and **`SNAPPY`**; encodings `PLAIN`,
+**`PLAIN_DICTIONARY`** and **`RLE_DICTIONARY`**; v1 `DATA_PAGE`; flat schemas;
+`REQUIRED` and `OPTIONAL`; `INT32` / `INT64` / `DOUBLE` / `BYTE_ARRAY`.
 
-Everything else throws with what it met — dictionary and delta encodings,
-byte-stream-split, v2 data pages, every compression codec, repeated (nested)
-columns. **A decoder that guesses at an encoding produces plausible numbers**,
-and plausible numbers from a file nobody re-checks is the worst failure this
+That set is **what pyarrow writes by default**, so most real files are now
+readable rather than only prunable.
+
+Everything else throws with what it met — gzip / zstd / brotli / lz4, delta
+encodings, byte-stream-split, v2 data pages, repeated (nested) columns. **A
+decoder that guesses at an encoding produces plausible numbers**, and
+plausible numbers from a file nobody re-checks is the worst failure this
 library could have: silent, and downstream of every guard.
+
+### How the snappy + dictionary path is checked
+
+`dictionary-snappy.parquet` is asserted to decode **value-for-value and
+null-for-null identical to `plain.parquet`** — the same dataset written two
+completely different ways, decoded independently. Without a second
+implementation to diff against, cross-encoding agreement is the strongest
+check available.
+
+Snappy here is the **raw** format, not framed: Parquet compresses each page
+body alone and records both lengths in the page header, so the stream framing
+has no job. The preamble is checked against the header's number rather than
+trusted, because framed bytes fed to a raw decoder read their frame header as
+a length.
+
+The one subtlety in snappy is that a copy element may reference bytes it is
+*currently producing* — an offset smaller than the length, which is how a
+repeating run is encoded. Copies are therefore byte-at-a-time from the growing
+output; slicing the source up front is the natural-looking implementation and
+truncates every run longer than its own period.
+
+`gzip.parquet` exists to stay unsupported. When snappy became readable, that
+fixture is what kept "statistics work on files this reader cannot decode"
+under test instead of quietly losing its only witness.
 
 `check-readable!` runs before any page byte is fetched, so a refusal costs a
 metadata lookup rather than a download.
@@ -114,7 +142,8 @@ make on its own.
 |---|---|
 | `parquet.thrift` | Thrift **compact protocol** decoder — Parquet metadata is written in it, so nothing is readable until this is. Self-contained byte grammar, no Parquet concepts. |
 | `parquet.footer` | `FileMetaData`: schema, row groups, column chunks, statistics. Two range reads locate everything about a file of any size. |
-| `parquet.decode` | Definition levels (RLE / bit-packing hybrid) and PLAIN values. |
+| `parquet.decode` | Definition levels (RLE / bit-packing hybrid), PLAIN values, dictionary indices, codec dispatch. |
+| `parquet.snappy` | Raw snappy decompression. |
 | `parquet.bytes` | The byte-range seam: `IByteSource`, plus `counting` and `prefetched`. |
 | `parquet.source` | The `IColumnSource`. |
 

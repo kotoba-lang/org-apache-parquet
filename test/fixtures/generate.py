@@ -29,12 +29,21 @@ pq.write_table(table, here / "plain.parquet", row_group_size=3,
                write_statistics=True, version="2.6",
                data_page_version="1.0")
 
-# dictionary-snappy.parquet — deliberately OUTSIDE that subset. Statistics
-# must still be readable from it, because the footer does not depend on how
-# the pages were encoded. That is the property that makes pruning and
-# min/max/count work on files this reader cannot decode.
+# dictionary-snappy.parquet — what pyarrow writes by DEFAULT, and what most
+# real files therefore are. Decoded, and asserted to agree value-for-value
+# with plain.parquet: two independent encodings of the same data.
 pq.write_table(table, here / "dictionary-snappy.parquet", row_group_size=3,
                compression="snappy", use_dictionary=True,
+               write_statistics=True, version="2.6")
+
+# gzip.parquet — deliberately OUTSIDE the supported subset, and it has to stay
+# that way. Statistics must remain readable from a file this reader cannot
+# decode, because the footer does not depend on how the pages were encoded;
+# that property is what makes pruning and min/max/count work regardless. When
+# snappy became supported, this fixture is what kept the property tested
+# instead of quietly losing its only witness.
+pq.write_table(table, here / "gzip.parquet", row_group_size=3,
+               compression="gzip", use_dictionary=True,
                write_statistics=True, version="2.6")
 
 for p in sorted(here.glob("*.parquet")):

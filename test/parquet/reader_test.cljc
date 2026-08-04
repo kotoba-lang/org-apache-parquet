@@ -29,6 +29,7 @@
 
 (def plain (delay (read-fixture "plain.parquet")))
 (def dict-snappy (delay (read-fixture "dictionary-snappy.parquet")))
+(def gzipped (delay (read-fixture "gzip.parquet")))
 
 ;; ── footer ──────────────────────────────────────────────────────────────────
 
@@ -75,14 +76,29 @@
 
 ;; ── the property that makes a partial reader useful ─────────────────────────
 
+(deftest snappy-dictionary-agrees-with-plain-value-for-value
+  (testing "what pyarrow writes by default, and therefore what most real files are"
+    (let [d (psrc/open @dict-snappy) p (psrc/open @plain)]
+      (doseq [col ["price" "region" "note"]
+              chunk [0 1 2]]
+        (is (= (:values (csrc/-read-column p chunk col))
+               (:values (csrc/-read-column d chunk col)))
+            (str col " chunk " chunk))
+        (is (= (:valid (csrc/-read-column p chunk col))
+               (:valid (csrc/-read-column d chunk col)))
+            "and the nulls land in the same places"))))
+  (testing "two independent encodings of one dataset agreeing is the strongest
+            check available without a second implementation to compare against"
+    (is (= [10 20 30] (:values (csrc/-read-column (psrc/open @dict-snappy) 0 "price"))))))
+
 (deftest statistics-work-on-a-file-this-reader-cannot-decode
-  (let [s (psrc/open @dict-snappy)]
+  (let [s (psrc/open @gzipped)]
     (testing "reading refuses, and names what it met"
       (let [e (try (csrc/-read-column s 0 "price") nil
                    (catch #?(:clj Exception :cljs :default) e e))]
-        (is (some? e) "a snappy dictionary file must not be silently mis-decoded")
+        (is (some? e) "a gzip file must not be silently mis-decoded")
         (is (= :parquet/unsupported (:type (ex-data e))))
-        (is (contains? (ex-data e) :codec) "the refusal says which codec")))
+        (is (= :gzip (:codec (ex-data e))) "the refusal says which codec")))
     (testing "but the footer does not depend on how the pages were encoded"
       (is (= {:rows 3 :nulls 0 :min 10 :max 30} (csrc/-chunk-stats s 0 "price")))
       (is (= 3 (csrc/-chunk-count s)))
@@ -179,7 +195,7 @@
             "one chunk's worth of bytes for a query over three row groups")))))
 
 (deftest a-refusal-costs-no-bytes
-  (let [c (pbytes/counting (pbytes/of-vector @dict-snappy))
+  (let [c (pbytes/counting (pbytes/of-vector @gzipped))
         s (psrc/open (:source c))
         after-open (:bytes (pbytes/read-counts c))]
     (is (thrown? #?(:clj Exception :cljs :default) (csrc/-read-column s 0 "price")))
