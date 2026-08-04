@@ -5,9 +5,16 @@
         {:git/url "https://github.com/kotoba-lang/columnar.git"
          :git/sha "b0862f6d41bbd45744362433e658f8b7e2f3ecca"}}
  :aliases
+ ;; kotobase-lake is a TEST dependency only. This repo provides a column
+ ;; source and must not know about catalogs, tenants or triple patterns —
+ ;; but something has to prove the whole chain works against a real file
+ ;; rather than a fake column source, and this is the end that has one.
  {:test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
-                      {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+                      {:git/tag "v0.5.1" :git/sha "dfb30dd"}
+                      io.github.kotoba-lang/kotobase-lake
+                      {:git/url "https://github.com/kotoba-lang/kotobase-lake.git"
+                       :git/sha "19cec4f3c4bb3f6763172dc60b86e8950accec01"}}
          :main-opts ["-m" "cognitect.test-runner"]
          :exec-fn cognitect.test-runner.api/test}
   :cljs {:extra-paths ["test"]
