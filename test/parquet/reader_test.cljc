@@ -11,6 +11,7 @@
             [columnar.source :as csrc]
             [columnar.vector :as cvec]
             [parquet.bytes :as pbytes]
+            [parquet.decode :as decode]
             [parquet.footer :as footer]
             [parquet.source :as psrc]
             #?(:clj [clojure.java.io :as io])))
@@ -29,7 +30,7 @@
 
 (def plain (delay (read-fixture "plain.parquet")))
 (def dict-snappy (delay (read-fixture "dictionary-snappy.parquet")))
-(def gzipped (delay (read-fixture "gzip.parquet")))
+(def delta (delay (read-fixture "delta.parquet")))
 
 ;; ── footer ──────────────────────────────────────────────────────────────────
 
@@ -92,13 +93,14 @@
     (is (= [10 20 30] (:values (csrc/-read-column (psrc/open @dict-snappy) 0 "price"))))))
 
 (deftest statistics-work-on-a-file-this-reader-cannot-decode
-  (let [s (psrc/open @gzipped)]
+  (let [s (psrc/open @delta)]
     (testing "reading refuses, and names what it met"
       (let [e (try (csrc/-read-column s 0 "price") nil
                    (catch #?(:clj Exception :cljs :default) e e))]
-        (is (some? e) "a gzip file must not be silently mis-decoded")
+        (is (some? e) "a delta-encoded file must not be silently mis-decoded")
         (is (= :parquet/unsupported (:type (ex-data e))))
-        (is (= :gzip (:codec (ex-data e))) "the refusal says which codec")))
+        (is (= [:delta-binary-packed] (:encoding (ex-data e)))
+            "the refusal names the encoding it met")))
     (testing "but the footer does not depend on how the pages were encoded"
       (is (= {:rows 3 :nulls 0 :min 10 :max 30} (csrc/-chunk-stats s 0 "price")))
       (is (= 3 (csrc/-chunk-count s)))
@@ -195,7 +197,7 @@
             "one chunk's worth of bytes for a query over three row groups")))))
 
 (deftest a-refusal-costs-no-bytes
-  (let [c (pbytes/counting (pbytes/of-vector @gzipped))
+  (let [c (pbytes/counting (pbytes/of-vector @delta))
         s (psrc/open (:source c))
         after-open (:bytes (pbytes/read-counts c))]
     (is (thrown? #?(:clj Exception :cljs :default) (csrc/-read-column s 0 "price")))
@@ -219,3 +221,28 @@
     (let [src (pbytes/prefetched 100 [[0 [1 2 3]]])]
       (is (thrown? #?(:clj Exception :cljs :default)
                    (pbytes/-read-range src 50 60))))))
+
+;; ── refusal, by name, without needing a fixture per codec ───────────────────
+;; check-readable! is pure, so every codec and encoding can be named here.
+;; A fixture per codec would be one more binary to keep byte-identical across
+;; environments, and gzip already proved that is not a property compressed
+;; output has — deflate is implementation-dependent, so the same generator
+;; produced different bytes on CI than locally.
+
+(deftest every-unsupported-codec-and-encoding-is-refused-by-name
+  (doseq [codec [:gzip :zstd :brotli :lz4 :lzo :lz4-raw]]
+    (let [e (try (decode/check-readable! {:codec codec :encodings [:plain]
+                                          :path ["price"]})
+                 nil (catch #?(:clj Exception :cljs :default) e e))]
+      (is (= :parquet/unsupported (:type (ex-data e))) (str codec))
+      (is (= codec (:codec (ex-data e))) (str codec " must be named"))))
+  (doseq [enc [:delta-binary-packed :delta-byte-array :delta-length-byte-array
+               :byte-stream-split]]
+    (let [e (try (decode/check-readable! {:codec :snappy :encodings [:plain enc]
+                                          :path ["price"]})
+                 nil (catch #?(:clj Exception :cljs :default) e e))]
+      (is (= [enc] (:encoding (ex-data e))) (str enc " must be named"))))
+  (testing "and the supported set passes"
+    (is (true? (decode/check-readable! {:codec :snappy
+                                        :encodings [:plain :rle :rle-dictionary]
+                                        :path ["price"]})))))

@@ -61,9 +61,19 @@ repeating run is encoded. Copies are therefore byte-at-a-time from the growing
 output; slicing the source up front is the natural-looking implementation and
 truncates every run longer than its own period.
 
-`gzip.parquet` exists to stay unsupported. When snappy became readable, that
+`delta.parquet` exists to stay unsupported. When snappy became readable, that
 fixture is what kept "statistics work on files this reader cannot decode"
-under test instead of quietly losing its only witness.
+under test instead of quietly losing its only witness — the refusal tests had
+been passing against a file that had just become decodable.
+
+It is DELTA_BINARY_PACKED and not gzip, though gzip was the obvious choice:
+**gzip byte-equality is not a property that holds across environments.**
+Deflate output is implementation-dependent, so the generator produced
+identical bytes on repeated local runs and different bytes on CI. The
+determinism gate caught it. Codec refusal is covered instead by unit tests on
+`check-readable!`, which is pure — it needs no fixture and can name every
+codec, where a fixture per codec would be one more binary required to be
+byte-identical everywhere.
 
 `check-readable!` runs before any page byte is fetched, so a refusal costs a
 metadata lookup rather than a download.
