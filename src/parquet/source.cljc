@@ -69,20 +69,43 @@
         (let [cm (chunk-meta meta chunk column)]
           ;; Before any byte is fetched: a refusal must not cost a download.
           (decode/check-readable! cm)
-          (let [start (:data-page-offset cm)
-                ;; The chunk's own compressed size, from the footer. This is
-                ;; what makes the range exact rather than a guess with a
-                ;; safety margin.
+          (let [;; A dictionary page, when present, precedes the data pages and
+                ;; is inside the same total_compressed_size. So the chunk
+                ;; begins at whichever offset comes first, and one range
+                ;; covers both.
+                dict-at (:dictionary-page-offset cm)
+                start (if dict-at (min dict-at (:data-page-offset cm))
+                          (:data-page-offset cm))
                 window (vec (pbytes/-read-range
                              src start (min (pbytes/-size src)
                                             (+ start (:total-compressed-size cm)))))
-                [header body] (footer/page-header window 0)]
+                codec (:codec cm)
+                physical (:type cm)
+                dictionary
+                (when dict-at
+                  (let [[dh dbody] (footer/page-header window (- dict-at start))]
+                    (when-not (= :dictionary-page (:type dh))
+                      (throw (ex-info "dictionary_page_offset does not point at a dictionary page"
+                                      {:type :parquet/malformed :page (:type dh)})))
+                    (decode/dictionary-page
+                     (decode/decompress codec window dbody
+                                        (+ dbody (:compressed-size dh))
+                                        (:uncompressed-size dh))
+                     0 dh physical)))
+                [header body] (footer/page-header window (- (:data-page-offset cm) start))]
             (when-not (= :data-page (:type header))
               (throw (ex-info (str "unsupported first page type " (pr-str (:type header)))
                               {:type :parquet/unsupported :page (:type header)})))
-            (let [{:keys [values valid]}
-                  (decode/data-page window body header (:type cm) (max-def-level meta column))]
-              (cvec/of (:type cm) values valid))))))))
+            ;; Decompressed into its own vector and decoded from 0: a page
+            ;; body's compressed and uncompressed lengths differ, so indices
+            ;; into the window mean nothing once a codec is involved.
+            (let [page (decode/decompress codec window body
+                                          (+ body (:compressed-size header))
+                                          (:uncompressed-size header))
+                  {:keys [values valid]}
+                  (decode/data-page page 0 header physical
+                                    (max-def-level meta column) dictionary)]
+              (cvec/of physical values valid))))))))
 
 (defn metadata
   "The parsed footer, for callers that want the schema or the row-group map
