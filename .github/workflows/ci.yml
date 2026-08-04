@@ -35,4 +35,9 @@ jobs:
         run: |
           python3 -m venv /tmp/pq && /tmp/pq/bin/pip install --quiet pyarrow
           /tmp/pq/bin/python test/fixtures/generate.py
-          git diff --exit-code -- test/fixtures
+          # gzip.parquet is excluded on purpose: deflate output is
+          # implementation-dependent, so byte-equality across environments is
+          # not a property it has. Measured — identical locally, different
+          # here. Its correctness is checked by decoding it and comparing
+          # values with plain.parquet instead.
+          git diff --exit-code -- test/fixtures ':!test/fixtures/gzip.parquet'

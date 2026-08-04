@@ -3,7 +3,14 @@
  ;; and IColumnSource is the shape it provides.
  :deps {io.github.kotoba-lang/columnar
         {:git/url "https://github.com/kotoba-lang/columnar.git"
-         :git/sha "b0862f6d41bbd45744362433e658f8b7e2f3ecca"}}
+         :git/sha "b0862f6d41bbd45744362433e658f8b7e2f3ecca"}
+        ;; GZIP, without a second inflate in this workspace. Huffman + LZ77 by
+        ;; hand in portable .cljc, no java.util.zip and no Node zlib — which
+        ;; is what lets this reader keep working on every runtime the rest of
+        ;; the stack runs on.
+        io.github.kotoba-lang/org-ietf-deflate
+        {:git/url "https://github.com/kotoba-lang/org-ietf-deflate.git"
+         :git/sha "430d754313e9082114ec00554e0b6770d9d318c5"}}
  :aliases
  ;; kotobase-lake is a TEST dependency only. This repo provides a column
  ;; source and must not know about catalogs, tenants or triple patterns —

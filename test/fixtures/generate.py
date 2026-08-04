@@ -55,5 +55,15 @@ pq.write_table(table, here / "delta.parquet", row_group_size=3,
                                 "big": "DELTA_BINARY_PACKED"},
                write_statistics=True, version="2.6")
 
+# gzip.parquet — a real gzip-compressed file, decoded through
+# org-ietf-deflate. NOT part of the byte-determinism gate: deflate output is
+# implementation-dependent, so "the reference writer produces exactly these
+# bytes" is not a claim gzip supports across environments (measured: identical
+# locally, different on CI). What IS checkable is that it decodes to the same
+# values as plain.parquet, and that is what the test asserts.
+pq.write_table(table, here / "gzip.parquet", row_group_size=3,
+               compression="gzip", use_dictionary=True,
+               write_statistics=True, version="2.6")
+
 for p in sorted(here.glob("*.parquet")):
     print(p.name, p.stat().st_size, "bytes")

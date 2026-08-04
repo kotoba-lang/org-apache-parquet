@@ -31,6 +31,7 @@
 (def plain (delay (read-fixture "plain.parquet")))
 (def dict-snappy (delay (read-fixture "dictionary-snappy.parquet")))
 (def delta (delay (read-fixture "delta.parquet")))
+(def gzipped (delay (read-fixture "gzip.parquet")))
 
 ;; ── footer ──────────────────────────────────────────────────────────────────
 
@@ -91,6 +92,14 @@
   (testing "two independent encodings of one dataset agreeing is the strongest
             check available without a second implementation to compare against"
     (is (= [10 20 30] (:values (csrc/-read-column (psrc/open @dict-snappy) 0 "price"))))))
+
+(deftest gzip-agrees-with-plain-value-for-value
+  (testing "decoded through org-ietf-deflate, not a second inflate here"
+    (let [g (psrc/open @gzipped) p (psrc/open @plain)]
+      (doseq [col ["price" "region" "note"] chunk [0 1 2]]
+        (is (= (:values (csrc/-read-column p chunk col))
+               (:values (csrc/-read-column g chunk col)))
+            (str col " chunk " chunk))))))
 
 (deftest statistics-work-on-a-file-this-reader-cannot-decode
   (let [s (psrc/open @delta)]
@@ -230,7 +239,7 @@
 ;; produced different bytes on CI than locally.
 
 (deftest every-unsupported-codec-and-encoding-is-refused-by-name
-  (doseq [codec [:gzip :zstd :brotli :lz4 :lzo :lz4-raw]]
+  (doseq [codec [:zstd :brotli :lz4 :lzo :lz4-raw]]
     (let [e (try (decode/check-readable! {:codec codec :encodings [:plain]
                                           :path ["price"]})
                  nil (catch #?(:clj Exception :cljs :default) e e))]
