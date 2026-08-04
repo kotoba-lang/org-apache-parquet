@@ -36,14 +36,23 @@ pq.write_table(table, here / "dictionary-snappy.parquet", row_group_size=3,
                compression="snappy", use_dictionary=True,
                write_statistics=True, version="2.6")
 
-# gzip.parquet — deliberately OUTSIDE the supported subset, and it has to stay
-# that way. Statistics must remain readable from a file this reader cannot
-# decode, because the footer does not depend on how the pages were encoded;
-# that property is what makes pruning and min/max/count work regardless. When
-# snappy became supported, this fixture is what kept the property tested
-# instead of quietly losing its only witness.
-pq.write_table(table, here / "gzip.parquet", row_group_size=3,
-               compression="gzip", use_dictionary=True,
+# delta.parquet — deliberately OUTSIDE the supported subset, and it has to
+# stay that way. Statistics must remain readable from a file this reader
+# cannot decode, because the footer does not depend on how the pages were
+# encoded; that property is what makes pruning and min/max/count work
+# regardless. When snappy became supported, this fixture is what kept the
+# property tested instead of quietly losing its only witness.
+#
+# DELTA_BINARY_PACKED and not gzip, though gzip was the obvious choice: gzip
+# byte-equality is not a property that holds across environments. Deflate
+# output is implementation-dependent, so the fixture regenerated identically
+# on one machine and differed on CI's — same size, different bytes. Codec
+# refusal is covered by unit tests on check-readable! instead, which need no
+# fixture and can name every codec.
+pq.write_table(table, here / "delta.parquet", row_group_size=3,
+               compression="none", use_dictionary=False,
+               column_encoding={"price": "DELTA_BINARY_PACKED",
+                                "big": "DELTA_BINARY_PACKED"},
                write_statistics=True, version="2.6")
 
 for p in sorted(here.glob("*.parquet")):
