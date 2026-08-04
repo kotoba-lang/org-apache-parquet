@@ -1,0 +1,144 @@
+(ns parquet.reader-test
+  "Decoded against files written by Parquet's own writer.
+
+  Every fixture here came out of pyarrow (`test/fixtures/generate.py`). A
+  fixture this repo generated itself would test the decoder against its own
+  misunderstanding of the format, and the failure mode of that is a decoder
+  that is confidently wrong on every real file."
+  (:require [clojure.test :refer [deftest is testing]]
+            [columnar.aggregate :as agg]
+            [columnar.plan :as plan]
+            [columnar.source :as csrc]
+            [columnar.vector :as cvec]
+            [parquet.footer :as footer]
+            [parquet.source :as psrc]
+            #?(:clj [clojure.java.io :as io])))
+
+(defn read-fixture [name]
+  #?(:clj (with-open [in (io/input-stream (io/file "test/fixtures" name))]
+            (let [out (java.io.ByteArrayOutputStream.)]
+              (io/copy in out)
+              (mapv #(bit-and % 0xff) (.toByteArray out))))
+     ;; Array.from on the Buffer itself, NOT on a Uint8Array over its
+     ;; .buffer: Node pools small allocations, so a Buffer's underlying
+     ;; ArrayBuffer is usually a shared slab and reading it whole yields the
+     ;; pool rather than the file. It failed as "missing leading PAR1".
+     :cljs (vec (js/Array.from (.readFileSync (js/require "fs")
+                                              (str "test/fixtures/" name))))))
+
+(def plain (delay (read-fixture "plain.parquet")))
+(def dict-snappy (delay (read-fixture "dictionary-snappy.parquet")))
+
+;; ── footer ──────────────────────────────────────────────────────────────────
+
+(deftest footer-parses-a-real-file
+  (let [m (footer/parse @plain)]
+    (is (= 9 (:num-rows m)))
+    (is (= ["price" "region" "note" "big"] (:columns m)))
+    (is (= 3 (count (:row-groups m))))
+    (is (re-find #"parquet" (str (:created-by m)))
+        "created-by identifies the reference writer that produced the fixture")
+    (testing "row groups carry the statistics pruning needs"
+      (is (= [{:nulls 0 :min 10 :max 30}
+              {:nulls 0 :min 110 :max 130}
+              {:nulls 0 :min 210 :max 230}]
+             (mapv #(:statistics (first (:columns %))) (:row-groups m)))))))
+
+(deftest a-truncated-or-foreign-file-is-refused
+  (is (thrown? #?(:clj Exception :cljs :default) (footer/parse (vec (repeat 4 0)))))
+  (testing "trailing magic alone is not enough"
+    (let [forged (into (vec (repeat 8 0)) footer/magic)]
+      (is (thrown? #?(:clj Exception :cljs :default) (footer/parse forged))))))
+
+;; ── values ──────────────────────────────────────────────────────────────────
+
+(deftest columns-decode-to-the-values-that-were-written
+  (let [s (psrc/open @plain)]
+    (is (= ["price" "region" "note" "big"] (csrc/-schema s)))
+    (is (= [10 20 30] (:values (csrc/-read-column s 0 "price"))))
+    (is (= [110 120 130] (:values (csrc/-read-column s 1 "price"))))
+    (is (= ["east" "east" "west"] (:values (csrc/-read-column s 0 "region")))
+        "BYTE_ARRAY is length-prefixed, not fixed-width")))
+
+(deftest definition-levels-put-the-nulls-back-where-they-were
+  (let [s (psrc/open @plain)
+        c0 (csrc/-read-column s 0 "note")
+        c2 (csrc/-read-column s 2 "note")]
+    (is (= [false true false] (:valid c0))
+        "PLAIN writes values only for present rows, so the levels decide
+         where they land")
+    (is (= "clearance" (cvec/value-at c0 1)))
+    (is (nil? (cvec/value-at c0 0)))
+    (is (= [false false false] (:valid c2)) "an all-null page")
+    (is (= 3 (cvec/null-count c2)))))
+
+;; ── the property that makes a partial reader useful ─────────────────────────
+
+(deftest statistics-work-on-a-file-this-reader-cannot-decode
+  (let [s (psrc/open @dict-snappy)]
+    (testing "reading refuses, and names what it met"
+      (let [e (try (csrc/-read-column s 0 "price") nil
+                   (catch #?(:clj Exception :cljs :default) e e))]
+        (is (some? e) "a snappy dictionary file must not be silently mis-decoded")
+        (is (= :parquet/unsupported (:type (ex-data e))))
+        (is (contains? (ex-data e) :codec) "the refusal says which codec")))
+    (testing "but the footer does not depend on how the pages were encoded"
+      (is (= {:rows 3 :nulls 0 :min 10 :max 30} (csrc/-chunk-stats s 0 "price")))
+      (is (= 3 (csrc/-chunk-count s)))
+      (is (= 3 (csrc/-chunk-rows s 0))))
+    (testing "so pruning and footer aggregates still work end to end"
+      (is (= {:value 230 :from :statistics :read 0}
+             (agg/aggregate s {:agg :max :column "price"})))
+      (is (= {:value 9 :from :statistics :read 0}
+             (agg/aggregate s {:agg :count}))))))
+
+;; ── end to end through the engine ───────────────────────────────────────────
+
+(deftest the-engine-prunes-a-real-parquet-file
+  (let [c (csrc/counting (psrc/open @plain))
+        {:keys [rows chunks-read chunks-skipped]}
+        (plan/scan (:source c) {:columns ["price"] :predicates [[:= "price" 120]]})]
+    (is (= [{:columnar.plan/row 4 "price" 120}] rows))
+    (is (= 1 chunks-read))
+    (is (= 2 chunks-skipped))
+    (is (= #{1} (:chunks (csrc/read-counts c)))
+        "two of three row groups were ruled out by footer statistics alone"))
+  (testing "a range predicate over a real file"
+    (let [c (csrc/counting (psrc/open @plain))
+          {:keys [rows]} (plan/scan (:source c) {:columns ["price"]
+                                                 :predicates [[:> "price" 200]]})]
+      (is (= [210 220 230] (mapv #(get % "price") rows)))
+      (is (= #{2} (:chunks (csrc/read-counts c))))))
+  (testing "aggregates from the footer touch nothing"
+    (let [c (csrc/counting (psrc/open @plain))]
+      (is (= 10 (:value (agg/aggregate (:source c) {:agg :min :column "price"}))))
+      (is (= 9 (:value (agg/aggregate (:source c) {:agg :count}))))
+      (is (empty? (:chunks (csrc/read-counts c))))))
+  (testing "and a filtered aggregate falls back to reading, correctly"
+    (let [r (agg/aggregate (psrc/open @plain)
+                           {:agg :max :column "price"
+                            :predicates [[:= "region" "east"]]})]
+      (is (= :scan (:from r)))
+      (is (= 210 (:value r))))))
+
+(deftest nulls-survive-the-whole-pipeline
+  (let [{:keys [rows]} (plan/scan (psrc/open @plain)
+                                  {:columns ["note"] :predicates [[:not-null "note"]]})]
+    (is (= ["clearance" "sale"] (mapv #(get % "note") rows))
+        "an all-null row group is skipped from its statistics, and the
+         remaining nulls are dropped by the exact recheck")))
+
+(deftest an-int64-past-double-precision-is-exact-or-refused
+  (testing "2^62+1 is beyond what a double holds exactly"
+    (let [s (psrc/open @plain)]
+      #?(:clj
+         (is (= [4611686018427387905 4611686018427387905 4611686018427387905]
+                (:values (csrc/-read-column s 0 "big")))
+             "the JVM has exact 64-bit integers, so it must return the value")
+         :cljs
+         (let [e (try (csrc/-read-column s 0 "big") nil
+                      (catch :default e e))]
+           (is (some? e))
+           (is (= :parquet/precision-unavailable (:type (ex-data e)))
+               "ClojureScript numbers are doubles; returning a rounded value
+                would be a wrong answer nothing downstream could detect"))))))

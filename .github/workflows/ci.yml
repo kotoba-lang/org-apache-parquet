@@ -1,0 +1,38 @@
+name: test
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21' }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - uses: DeLaGuardo/setup-clojure@13.0
+        with: { cli: latest }
+
+      - name: JVM
+        run: clojure -M:test
+
+      - run: npm install -g nbb
+      # Not a duplicate. The ClojureScript runs found three defects here that
+      # the JVM suite did not: Node Buffer pooling, a precision refusal raised
+      # in the wrong layer, and int64 rounding past 2^53.
+      - name: ClojureScript (nbb, interpreted)
+        run: nbb --classpath "src:test:$(clojure -Spath)" test/run.cljs
+      - name: ClojureScript (cljs.main, compiled)
+        run: clojure -M:cljs -m cljs.main --target node -m parquet.cljs-runner
+
+      - name: lint
+        run: clojure -M:lint
+
+      # The fixtures must stay byte-identical to what the reference writer
+      # produces, or the suite is testing this repo against its own past
+      # misunderstanding rather than against Parquet.
+      - name: fixtures still match the reference writer
+        run: |
+          python3 -m venv /tmp/pq && /tmp/pq/bin/pip install --quiet pyarrow
+          /tmp/pq/bin/python test/fixtures/generate.py
+          git diff --exit-code -- test/fixtures
