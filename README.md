@@ -1,8 +1,9 @@
 # org-apache-parquet
 
-**A Parquet reader in portable `.cljc`**, providing
+**A Parquet reader and writer in portable `.cljc`**, providing
 [`columnar`](https://github.com/kotoba-lang/columnar)'s `IColumnSource`. No
-Rust, no JNI, no native library — the format is decoded from bytes.
+Rust, no JNI, no native library — the format is decoded from, and encoded to,
+bytes.
 
 ```clojure
 (require '[parquet.source :as pq] '[columnar.plan :as plan])
@@ -86,6 +87,55 @@ byte-identical everywhere.
 
 `check-readable!` runs before any page byte is fetched, so a refusal costs a
 metadata lookup rather than a download.
+
+## Writing, and why statistics are the point
+
+`parquet.write` takes `columnar.vector` columns and emits file bytes, one row
+group per batch.
+
+```clojure
+(require '[parquet.write :as pw])
+(pw/of-columns [["price" (cvec/column :int64 [10 20 30])]])
+```
+
+It exists because of what the *other* format in this workspace cannot do.
+[`org-apache-arrow`](https://github.com/kotoba-lang/org-apache-arrow) can also
+materialise a query result, but **Arrow IPC records no column statistics**, so
+every later query over that object reads all of it. Chain a few
+materialisations and the intermediates are strictly weaker than the Parquet
+they came from.
+
+So this writer computes min/max/null-count as it goes — it has the columns in
+hand — and puts them in the footer. There is a test asserting the consequence
+directly: a query over a file written here reads **one** row group and skips
+two.
+
+It writes `int32`, `int64`, `double`, `byte_array` — exactly the set
+`parquet.decode` reads back, because writing what our own reader refuses would
+be a strange thing to own. `:utf8` maps to `byte_array`, so a column read out
+of an Arrow file writes here without the caller restating its type; that is
+how a materialised result gains statistics.
+
+### Our own tests cannot prove the output is valid Parquet
+
+Two failures were measured while building this, and **both passed every test
+in this repo**:
+
+1. `ColumnChunk.file_offset` omitted. It is `required` in the thrift IDL and
+   our reader never looks at it — so the file round-tripped perfectly here,
+   and pyarrow could not deserialize the footer at all.
+2. `FileMetaData.column_orders` omitted. Every file opened, every value was
+   correct, and **every statistic read back as `None`**, because the spec
+   forbids trusting `min_value`/`max_value` when no sort order is declared.
+   Parquet was chosen over an invented sidecar precisely so that *other* tools
+   could use the statistics, so this was a total failure of the writer's
+   purpose that was invisible from inside the repo.
+
+So the correctness gate is CI writing files with `parquet.emit-for-python` and
+handing them to pyarrow — `validate(full=True)` plus explicit per-row-group
+statistics assertions. That gate was checked by breaking the writer on purpose:
+with `column_orders` removed, all seven files still report `ok` on open and
+read, and the gate fails with `stats (None, None, 0) != (10, 30, 0)`.
 
 ## Integers are exact, or refused — never rounded
 
