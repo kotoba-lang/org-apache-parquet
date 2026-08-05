@@ -3,7 +3,7 @@
  ;; and IColumnSource is the shape it provides.
  :deps {io.github.kotoba-lang/columnar
         {:git/url "https://github.com/kotoba-lang/columnar.git"
-         :git/sha "b0862f6d41bbd45744362433e658f8b7e2f3ecca"}
+         :git/sha "d89813a3db2e59376c6732a9cbbfbb8c0687544c"}
         ;; GZIP, without a second inflate in this workspace. Huffman + LZ77 by
         ;; hand in portable .cljc, no java.util.zip and no Node zlib — which
         ;; is what lets this reader keep working on every runtime the rest of

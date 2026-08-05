@@ -1,86 +1,35 @@
 (ns parquet.bytes
-  "Where the bytes come from, as a seam rather than an argument.
+  "Parquet's range planning, over the shared byte seam.
 
-  The first version of this reader took the whole file as a vector. It was
-  correct and it defeated the point: Parquet exists so that a query reads a
-  footer and two column chunks instead of forty gigabytes, and a reader that
-  demands the forty gigabytes first has thrown that away before it starts.
+  `IByteSource` and its generic helpers were defined here, back when Parquet
+  was the only format that needed them. They are now `columnar.bytes` — beside
+  `IColumnSource`, which is the other half of the same seam — because a second
+  `:scan` format (`org-apache-arrow`) needs the identical protocol, and a copy
+  in each means a caller holding a range-reader cannot hand it to both, and an
+  instrument that counts bytes has to be written once per format. Two things
+  that can substitute for each other are one thing (ADR-2607299700).
 
-  So a source answers **ranges**, and every read this library performs is one
-  of them. `counting` records what was asked for, which is how a test proves
-  the reader touched a column chunk and nothing else — an assertion on the
-  *answer* cannot tell that apart from reading everything and slicing.
+  What stays here is the part that is actually about Parquet: `footer-ranges`
+  describes *Parquet's* footer, not ranges in general.
 
-  ## Synchronous, deliberately
-
-  `columnar/IColumnSource` is synchronous, so this is too. On a host where
-  fetching a range is asynchronous — a Worker doing HTTP Range requests — the
-  caller pre-fetches into `prefetched` and passes that. `footer-ranges` exists
-  so such a caller knows what to fetch before it can parse anything: it is a
-  two-round-trip protocol (tail, then footer), and pretending otherwise would
-  mean either an async rewrite of the engine or a silent whole-file read."
+  The protocol and helpers are re-exported rather than deleted, so
+  `(reify parquet.bytes/IByteSource ...)` and
+  `(satisfies? parquet.bytes/IByteSource x)` keep working — these vars hold
+  the same protocol, so a source reified through either name satisfies both.
+  New code should require `columnar.bytes` directly."
+  (:require [columnar.bytes :as cbytes])
   (:refer-clojure :exclude [bytes]))
 
-(defprotocol IByteSource
-  (-size [src] "Total bytes in the object. Known without reading it — from a
-    HEAD, a stat, or the catalog's `:object/size-bytes`.")
-  (-read-range [src start end] "Bytes in `[start end)` as a vector of unsigned
-    ints. `end` is exclusive."))
-
-(defn of-vector
-  "A source over a whole file already in memory. For tests, and for objects
-  small enough that ranging them is pointless."
-  [v]
-  (let [v (vec v)]
-    (reify IByteSource
-      (-size [_] (count v))
-      (-read-range [_ start end] (subvec v start end)))))
-
-(defn prefetched
-  "A source over ranges someone else already fetched.
-
-  `chunks` is a seq of `[start bytes]`. A range that no chunk covers throws
-  rather than returning short: a decoder handed fewer bytes than it asked for
-  produces nonsense, and the caller who under-fetched is the one who can fix
-  it."
-  [size chunks]
-  (let [chunks (vec chunks)]
-    (reify IByteSource
-      (-size [_] size)
-      (-read-range [_ start end]
-        (or (some (fn [[at bs]]
-                    (let [stop (+ at (count bs))]
-                      (when (and (<= at start) (<= end stop))
-                        (subvec (vec bs) (- start at) (- end at)))))
-                  chunks)
-            (throw (ex-info "range was not prefetched"
-                            {:type :parquet/missing-range
-                             :want [start end]
-                             :have (mapv (fn [[at bs]] [at (+ at (count bs))]) chunks)})))))))
-
-(defn counting
-  "Wrap a source so every range is recorded.
-
-  `{:ranges [[start end] ..] :bytes n}`. The reason this exists is the same
-  reason `columnar.source/counting` does: correct answers prove nothing about
-  how much was read to get them."
-  [src]
-  (let [log (atom {:ranges [] :bytes 0})]
-    {:log log
-     :source (reify IByteSource
-               (-size [_] (-size src))
-               (-read-range [_ start end]
-                 (swap! log (fn [l] (-> l
-                                        (update :ranges conj [start end])
-                                        (update :bytes + (- end start)))))
-                 (-read-range src start end)))}))
-
-(defn read-counts [c] @(:log c))
-
-(defn source
-  "Coerce `x` to an `IByteSource`. A vector is taken as a whole file."
-  [x]
-  (if (satisfies? IByteSource x) x (of-vector x)))
+;; Re-exports. The same vars under a second name, so identity holds across it.
+(def IByteSource cbytes/IByteSource)
+(def -size cbytes/-size)
+(def -read-range cbytes/-read-range)
+(def of-vector cbytes/of-vector)
+(def prefetched cbytes/prefetched)
+(def counting cbytes/counting)
+(def read-counts cbytes/read-counts)
+(def source cbytes/source)
+(def of-fn cbytes/of-fn)
 
 (def footer-suffix-bytes
   "The fixed tail every Parquet file ends with: a 4-byte footer length and
@@ -91,9 +40,9 @@
   "The ranges a caller must fetch, in order, to parse the footer of a file of
   `size` bytes.
 
-  The second depends on the first, so this returns a function rather than a
-  list: an async caller fetches the tail, hands it back, and is told what to
-  fetch next. Stating the dependency in the type is cheaper than discovering
-  it as a wrong answer from a single speculative read."
+  The second depends on the first, so this returns a map rather than a list:
+  an async caller fetches the tail, hands it back, and is told what to fetch
+  next. Stating the dependency in the type is cheaper than discovering it as a
+  wrong answer from a single speculative read."
   [size]
   {:tail [(- size footer-suffix-bytes) size]})
