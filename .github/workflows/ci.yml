@@ -28,6 +28,26 @@ jobs:
       - name: lint
         run: clojure -M:lint
 
+      # The claim the in-repo suite CANNOT make. `parquet.writer-test` shares a
+      # code base with the reader, so the failures that matter most pass it.
+      # Two were measured while building the writer, and BOTH were green here:
+      #
+      #   1. `ColumnChunk.file_offset` omitted -- `required` in the thrift IDL,
+      #      never read by us. Round-tripped perfectly; pyarrow could not
+      #      deserialize the footer at all.
+      #   2. `FileMetaData.column_orders` omitted -- every file opened, every
+      #      value correct, and EVERY STATISTIC invisible, because the spec
+      #      forbids trusting min_value/max_value with no declared sort order.
+      #      Parquet was chosen over a sidecar precisely so other tools could
+      #      read the statistics, so that was a total failure of the writer's
+      #      purpose that nothing inside this repo could see.
+      - name: files we WROTE are accepted by the reference reader
+        run: |
+          python3 -m venv /tmp/pqv && /tmp/pqv/bin/pip install --quiet pyarrow
+          mkdir -p /tmp/parquet-out
+          clojure -M:emit /tmp/parquet-out
+          /tmp/pqv/bin/python test/fixtures/verify_written.py /tmp/parquet-out
+
       # The fixtures must stay byte-identical to what the reference writer
       # produces, or the suite is testing this repo against its own past
       # misunderstanding rather than against Parquet.

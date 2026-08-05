@@ -169,3 +169,128 @@
   (first (read-struct bs i)))
 
 (defn parse-struct-with-end [bs i] (read-struct bs i))
+
+;; ── encoding ────────────────────────────────────────────────────────────────
+;;
+;; The same grammar in the other direction. Kept here rather than in a writer
+;; namespace for the reason the reader is here: this is a protocol, not a
+;; Parquet concept, and one home for it means the field-header rules are
+;; written down once.
+;;
+;; Two things the compact protocol does that a naive encoder gets wrong:
+;;
+;; - **A field id is stored as a DELTA from the previous field**, in the high
+;;   nibble, and only when that delta is 1..15. Fields must therefore be
+;;   emitted in ascending id order, and a larger gap falls back to a zigzag
+;;   varint. Emitting them out of order produces a struct that decodes to
+;;   different field ids without failing.
+;; - **A boolean has no value bytes.** Its value lives in the field header's
+;;   type nibble (1 for true, 2 for false), so a bool written as "type 3 plus
+;;   a byte" desynchronises everything after it.
+
+(def ^:private type-ids
+  {:bool-true 1 :bool-false 2 :byte 3 :i16 4 :i32 5 :i64 6
+   :double 7 :binary 8 :list 9 :set 10 :map 11 :struct 12})
+
+(defn write-varint
+  "ULEB128, over an **unsigned** 64-bit value.
+
+  Unsigned matters: zigzag of a value at or above 2^62 sets the top bit, and a
+  loop that tests `(< v 0x80)` on a signed long then sees a negative number,
+  decides it fits in one byte, and emits it as one. The result decodes to
+  something small and plausible. Measured: 2^62+1 came back as 1. So the JVM
+  path shifts with `unsigned-bit-shift-right` and tests the high bits directly.
+
+  ClojureScript has no 64-bit integer, so a magnitude past `MAX_SAFE_INTEGER`
+  is refused rather than written rounded — the rule this repo applies in both
+  directions."
+  [v]
+  #?(:clj (loop [v (long v) acc []]
+            (if (zero? (bit-and v (bit-not 0x7f)))
+              (conj acc (bit-and v 0x7f))
+              (recur (unsigned-bit-shift-right v 7)
+                     (conj acc (bit-or 0x80 (bit-and v 0x7f))))))
+     :cljs (do
+             (when (> v js/Number.MAX_SAFE_INTEGER)
+               (throw (ex-info "integer exceeds this runtime's exact range"
+                               {:type :parquet/precision-unavailable :approx v})))
+             ;; `mod`, not `bit-and`: ClojureScript's bitwise ops coerce to
+             ;; int32, so `(bit-and v 0x7f)` silently truncates above 2^32.
+             (loop [v v acc []]
+               (if (< v 0x80)
+                 (conj acc v)
+                 (recur (js/Math.floor (/ v 128))
+                        (conj acc (bit-or 0x80 (mod v 128)))))))))
+
+(defn zigzag-encode
+  "The inverse of `zigzag`: signed → unsigned, small negatives staying small.
+
+  On the JVM the shift-left deliberately wraps — that IS the unsigned answer,
+  and `write-varint` consumes it as unsigned."
+  [n]
+  #?(:clj (let [n (long n)] (bit-xor (bit-shift-left n 1) (bit-shift-right n 63)))
+     :cljs (let [z (if (neg? n) (- (* 2 (- n)) 1) (* 2 n))]
+             (when (> z js/Number.MAX_SAFE_INTEGER)
+               (throw (ex-info "integer exceeds this runtime's exact range"
+                               {:type :parquet/precision-unavailable :approx n})))
+             z)))
+
+(defn double-bytes
+  "8 bytes, little-endian IEEE 754."
+  [v]
+  #?(:clj (let [b (Double/doubleToLongBits (double v))]
+            (mapv #(bit-and (unsigned-bit-shift-right b (* 8 %)) 0xff) (range 8)))
+     :cljs (let [buf (js/ArrayBuffer. 8)]
+             (.setFloat64 (js/DataView. buf) 0 v true)
+             (vec (js/Array.from (js/Uint8Array. buf))))))
+
+(defn string-bytes [s]
+  #?(:clj (mapv #(bit-and % 0xff) (.getBytes ^String s "UTF-8"))
+     :cljs (vec (js/Array.from (.encode (js/TextEncoder.) s)))))
+
+(defn- value-bytes [type v]
+  (case type
+    (:i16 :i32 :i64) (write-varint (zigzag-encode v))
+    :byte [(bit-and v 0xff)]
+    :double (double-bytes v)
+    :binary (into (write-varint (count v)) v)
+    ;; Already-encoded bytes: a nested struct carries its own stop byte, and a
+    ;; list carries its own element header.
+    (:struct :list) (vec v)))
+
+(defn encode-list
+  "A list field's value: an element header, then the elements' encodings back
+  to back — elements are NOT field-tagged."
+  [elem-type items]
+  (let [n (count items)
+        tid (type-ids elem-type)
+        header (if (< n 15)
+                 [(bit-or (bit-shift-left n 4) tid)]
+                 (into [(bit-or 0xF0 tid)] (write-varint n)))]
+    (into header (mapcat #(value-bytes elem-type %)) items)))
+
+(defn encode-struct
+  "`fields` is an ordered seq of `[field-id type value]`, **ascending by id**.
+
+  A `nil` value omits the field, which is how an optional field is left to its
+  default rather than written explicitly."
+  [fields]
+  (let [fields (remove (fn [[_ _ v]] (nil? v)) fields)]
+    (conj
+     (vec (:out (reduce
+                 (fn [{:keys [last out]} [fid type v]]
+                   (when (<= fid last)
+                     (throw (ex-info "thrift fields must be emitted in ascending id order"
+                                     {:type :parquet/encoder-misuse :field fid :after last})))
+                   (let [tid (case type
+                               :bool (if v (type-ids :bool-true) (type-ids :bool-false))
+                               (type-ids type))
+                         delta (- fid last)
+                         header (if (<= 1 delta 15)
+                                  [(bit-or (bit-shift-left delta 4) tid)]
+                                  (into [tid] (write-varint (zigzag-encode fid))))
+                         body (if (= type :bool) [] (value-bytes type v))]
+                     {:last fid :out (into (into out header) body)}))
+                 {:last 0 :out []}
+                 fields)))
+     0)))                                   ; the struct stop byte
