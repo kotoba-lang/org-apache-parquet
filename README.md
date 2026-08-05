@@ -29,14 +29,14 @@ aggregate returns `{:from :statistics :read 0}`.
 
 ## What it decodes, and what it refuses by name
 
-Supported: codecs `UNCOMPRESSED`, **`SNAPPY`** and **`GZIP`**; encodings `PLAIN`,
+Supported: codecs `UNCOMPRESSED`, **`SNAPPY`**, **`GZIP`** and **`ZSTD`**; encodings `PLAIN`,
 **`PLAIN_DICTIONARY`** and **`RLE_DICTIONARY`**; v1 `DATA_PAGE`; flat schemas;
 `REQUIRED` and `OPTIONAL`; `INT32` / `INT64` / `DOUBLE` / `BYTE_ARRAY`.
 
 That set is **what pyarrow writes by default**, so most real files are now
 readable rather than only prunable.
 
-Everything else throws with what it met — zstd / brotli / lz4, delta
+Everything else throws with what it met — brotli / lz4 / lzo, delta
 encodings, byte-stream-split, v2 data pages, repeated (nested) columns. **A
 decoder that guesses at an encoding produces plausible numbers**, and
 plausible numbers from a file nobody re-checks is the worst failure this

@@ -65,5 +65,14 @@ pq.write_table(table, here / "gzip.parquet", row_group_size=3,
                compression="gzip", use_dictionary=True,
                write_statistics=True, version="2.6")
 
+# zstd.parquet — what Spark, Trino and Databricks commonly write, and what
+# this reader refused by name until org-ietf-zstd was wired in. Included in
+# the byte-determinism gate: unlike deflate, zstd's reference encoder is
+# deterministic for a fixed level, and pyarrow pins the level.
+pq.write_table(table, here / "zstd.parquet", row_group_size=3,
+               compression="zstd", use_dictionary=False,
+               write_statistics=True, version="2.6",
+               data_page_version="1.0")
+
 for p in sorted(here.glob("*.parquet")):
     print(p.name, p.stat().st_size, "bytes")

@@ -7,14 +7,15 @@
   nobody can re-check is the worst failure available to this library — worse
   than not reading the file, because it is silent.
 
-  Supported: `UNCOMPRESSED`, `SNAPPY` and `GZIP` codecs; `PLAIN`, `PLAIN_DICTIONARY`
-  and `RLE_DICTIONARY` encodings; `DATA_PAGE` (v1); flat schemas; `REQUIRED`
-  and `OPTIONAL` columns. Not supported, by name: zstd / brotli / lz4,
-  delta encodings, byte-stream-split, v2 data pages, and repeated (nested)
-  columns."
+  Supported: `UNCOMPRESSED`, `SNAPPY`, `GZIP` and `ZSTD` codecs; `PLAIN`,
+  `PLAIN_DICTIONARY` and `RLE_DICTIONARY` encodings; `DATA_PAGE` (v1); flat
+  schemas; `REQUIRED` and `OPTIONAL` columns. Not supported, by name: brotli /
+  lz4 / lzo, delta encodings, byte-stream-split, v2 data pages, and repeated
+  (nested) columns."
   (:require [deflate.core :as deflate]
             [parquet.snappy :as snappy]
-            [parquet.thrift :as th]))
+            [parquet.thrift :as th]
+            [zstd.core :as zstd]))
 
 (defn decompress
   "A page body, whatever codec it arrived in.
@@ -33,6 +34,17 @@
     :gzip (let [out (deflate/gunzip (subvec (vec bs) start end))]
             (when (and uncompressed-size (not= (long uncompressed-size) (count out)))
               (throw (ex-info "gzip output is not the length the page header declared"
+                              {:type :parquet/codec-length-mismatch
+                               :header uncompressed-size :actual (count out)})))
+            (vec out))
+    ;; `org-ietf-zstd` for the same reason as deflate above. The declared
+    ;; uncompressed size is checked rather than trusted: zstd frames carry
+    ;; their own content size and checksum, so a mismatch means the page
+    ;; header and the frame disagree about the same bytes, and a decoder that
+    ;; picked one silently would hand the caller a short column.
+    :zstd (let [out (zstd/decompress (subvec (vec bs) start end))]
+            (when (and uncompressed-size (not= (long uncompressed-size) (count out)))
+              (throw (ex-info "zstd output is not the length the page header declared"
                               {:type :parquet/codec-length-mismatch
                                :header uncompressed-size :actual (count out)})))
             (vec out))
@@ -190,7 +202,7 @@
                          (recur (inc i) vs (conj out nil)))))
            :valid valid})))))
 
-(def supported-codecs #{:uncompressed :snappy :gzip})
+(def supported-codecs #{:uncompressed :snappy :gzip :zstd})
 (def supported-encodings
   (into #{:plain :rle :bit-packed} dictionary-encodings))
 

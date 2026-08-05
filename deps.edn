@@ -10,7 +10,15 @@
         ;; the stack runs on.
         io.github.kotoba-lang/org-ietf-deflate
         {:git/url "https://github.com/kotoba-lang/org-ietf-deflate.git"
-         :git/sha "430d754313e9082114ec00554e0b6770d9d318c5"}}
+         :git/sha "430d754313e9082114ec00554e0b6770d9d318c5"}
+        ;; ZSTD, same reasoning as deflate: a zero-dep portable .cljc decoder
+        ;; rather than a second implementation here or a per-runtime native
+        ;; binding. zstd is what Spark, Trino and Databricks commonly write, so
+        ;; refusing it meant a large share of real Parquet could be pruned and
+        ;; counted but never read.
+        io.github.kotoba-lang/org-ietf-zstd
+        {:git/url "https://github.com/kotoba-lang/org-ietf-zstd.git"
+         :git/sha "5362525f26e1dd7646cf917e9b485df2028c3967"}}
  :aliases
  ;; kotobase-lake is a TEST dependency only. This repo provides a column
  ;; source and must not know about catalogs, tenants or triple patterns —

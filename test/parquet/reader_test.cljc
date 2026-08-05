@@ -32,6 +32,7 @@
 (def dict-snappy (delay (read-fixture "dictionary-snappy.parquet")))
 (def delta (delay (read-fixture "delta.parquet")))
 (def gzipped (delay (read-fixture "gzip.parquet")))
+(def zstded (delay (read-fixture "zstd.parquet")))
 
 ;; ── footer ──────────────────────────────────────────────────────────────────
 
@@ -100,6 +101,51 @@
         (is (= (:values (csrc/-read-column p chunk col))
                (:values (csrc/-read-column g chunk col)))
             (str col " chunk " chunk))))))
+
+(deftest zstd-agrees-with-plain-value-for-value
+  ;; zstd is what Spark, Trino and Databricks commonly write, so refusing it
+  ;; meant a large share of real Parquet could be pruned and counted but never
+  ;; read. Decoded through org-ietf-zstd -- FSE, Huffman and treeless literals
+  ;; in portable .cljc -- rather than a native binding that would exist on
+  ;; exactly one of the runtimes this reader has to keep running on.
+  (let [z (psrc/open @zstded) p (psrc/open @plain)]
+    ;; `big` is excluded here for the reason the gzip test excludes it: it
+    ;; holds a value past 2^53, which ClojureScript refuses rather than
+    ;; rounds. That is asserted separately below, where the point is that the
+    ;; CODEC does not change it.
+    (doseq [col ["price" "region" "note"] chunk [0 1 2]]
+      (is (= (:values (csrc/-read-column p chunk col))
+             (:values (csrc/-read-column z chunk col)))
+          (str col " chunk " chunk))))
+  (testing "a value past 2^53 behaves identically under zstd and uncompressed --
+            exact on the JVM, refused on ClojureScript. Decompression happens
+            before decoding, so a codec must not change what is representable."
+    (let [read-big (fn [bs] (:values (csrc/-read-column (psrc/open bs) 0 "big")))]
+      #?(:clj (is (= (read-big @plain) (read-big @zstded)))
+         :cljs (do (is (thrown? :default (read-big @plain)))
+                   (is (thrown? :default (read-big @zstded)))))))
+  (testing "and a zstd file still prunes, because statistics never depended on the codec"
+    (let [{:keys [rows chunks-read chunks-skipped]}
+          (plan/scan (psrc/open @zstded)
+                     {:columns ["price"] :predicates [[:= "price" 120]]})]
+      (is (= [{:columnar.plan/row 4 "price" 120}] rows))
+      (is (= 1 chunks-read))
+      (is (= 2 chunks-skipped)))))
+
+(deftest a-codec-refusal-still-happens-before-any-download
+  ;; zstd moved from the refused set to the supported one, and the guard that
+  ;; makes a refusal cost no bytes must keep applying to what is still refused.
+  ;; check-readable! is a SECOND refusal site from `decompress`, and adding a
+  ;; codec to one without the other leaves the reader refusing what it can
+  ;; decode -- measured while wiring zstd in.
+  (is (contains? decode/supported-codecs :zstd))
+  (is (not (contains? decode/supported-codecs :brotli)))
+  (let [e (try (decode/check-readable! {:codec :brotli :encodings [:plain] :path ["p"]}) nil
+               (catch #?(:clj Exception :cljs :default) e (ex-data e)))]
+    (is (= :parquet/unsupported (:type e)))
+    (is (= :brotli (:codec e)))
+    (is (contains? (set (:supported e)) :zstd)
+        "the refusal lists what IS supported, so it stays accurate as codecs land")))
 
 (deftest statistics-work-on-a-file-this-reader-cannot-decode
   (let [s (psrc/open @delta)]
@@ -239,7 +285,9 @@
 ;; produced different bytes on CI than locally.
 
 (deftest every-unsupported-codec-and-encoding-is-refused-by-name
-  (doseq [codec [:zstd :brotli :lz4 :lzo :lz4-raw]]
+  ;; :zstd left this list when org-ietf-zstd was wired in -- the set is
+  ;; asserted against `supported-codecs` below so the two cannot drift.
+  (doseq [codec [:brotli :lz4 :lzo :lz4-raw]]
     (let [e (try (decode/check-readable! {:codec codec :encodings [:plain]
                                           :path ["price"]})
                  nil (catch #?(:clj Exception :cljs :default) e e))]
@@ -254,4 +302,10 @@
   (testing "and the supported set passes"
     (is (true? (decode/check-readable! {:codec :snappy
                                         :encodings [:plain :rle :rle-dictionary]
-                                        :path ["price"]})))))
+                                        :path ["price"]}))))
+  (testing "every supported codec is accepted, so this list cannot drift from
+            `supported-codecs` as codecs land"
+    (doseq [codec decode/supported-codecs]
+      (is (true? (decode/check-readable! {:codec codec :encodings [:plain]
+                                          :path ["price"]}))
+          (str codec " is in supported-codecs and must not be refused")))))
