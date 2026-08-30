@@ -1,7 +1,11 @@
 {:paths ["src"]
  ;; columnar is the only dependency: this repo exists to be a provider for it,
  ;; and IColumnSource is the shape it provides.
- :deps {io.github.kotoba-lang/columnar
+ :deps {;; The snappy codec, so pages can be compressed as well as read.
+        io.github.kotoba-lang/com-google-snappy
+        {:git/url "https://github.com/kotoba-lang/com-google-snappy.git"
+         :git/sha "d43d3ad64b0dd2cf1449bc3c241400885860f23f"}
+        io.github.kotoba-lang/columnar
         {:git/url "https://github.com/kotoba-lang/columnar.git"
          :git/sha "d89813a3db2e59376c6732a9cbbfbb8c0687544c"}
         ;; GZIP, without a second inflate in this workspace. Huffman + LZ77 by

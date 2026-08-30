@@ -31,12 +31,34 @@
   **for the present rows only** — which is why the levels have to be written
   before the count of values is known."
   (:require [columnar.vector :as cvec]
-            [parquet.thrift :as th]))
+            [parquet.thrift :as th]
+            [snappy.core :as snappy]))
 
 (def ^:private physical-id {:boolean 0 :int32 1 :int64 2 :float 4 :double 5
                             :byte-array 6})
 (def ^:private repetition-id {:required 0 :optional 1 :repeated 2})
 (def ^:private encoding-id {:plain 0 :rle 3})
+
+(def codec-id
+  "Parquet's CompressionCodec enum, for the codecs this writer can produce.
+
+  The others in the enum (gzip, lzo, brotli, lz4, zstd) are absent rather than
+  listed and rejected later: a name in this map is a promise that a page body
+  can actually be compressed with it, and this workspace has one compressor
+  for a Parquet codec. `org-ietf-zstd` writes conformant frames of RAW blocks
+  and has no encoder, so declaring ZSTD here would produce files that are
+  correct, larger than uncompressed, and labelled compressed."
+  {:uncompressed 0 :snappy 1})
+
+(defn- compress-body
+  "-> the bytes a page carries, for `codec`."
+  [codec body]
+  (case codec
+    :uncompressed body
+    :snappy (snappy/compress body)
+    (throw (ex-info (str "parquet: cannot write codec " (pr-str codec))
+                    {:type :parquet/unsupported-codec :codec codec
+                     :writable (vec (sort (keys codec-id)))}))))
 (def ^:private converted-utf8 0)
 
 (def writable
@@ -113,8 +135,14 @@
 ;; ── one column chunk ────────────────────────────────────────────────────────
 
 (defn- column-chunk
-  "`{:bytes .. :stats .. :num-values ..}` for one column of one row group."
-  [{:keys [physical required?]} col]
+  "`{:bytes .. :stats .. :num-values .. :uncompressed ..}` for one column of
+  one row group.
+
+  `:uncompressed` is what the chunk would have occupied uncompressed, header
+  included. Parquet records both totals, and a reader that trusts
+  total_uncompressed_size to size a buffer gets a short one if the writer
+  reports the compressed number twice."
+  [{:keys [physical required?]} col codec]
   (let [n (cvec/count col)
         present (filterv #(cvec/valid-at? col %) (range n))
         values (mapv #(cvec/value-at col %) present)
@@ -127,30 +155,33 @@
                  (let [lv (rle-levels (mapv #(if (cvec/valid-at? col %) 1 0) (range n)) 1)]
                    (into (into (le (count lv) 4) lv)
                          (mapcat #(plain-value physical %)) values)))
+          cbody (compress-body codec body)
           header (th/encode-struct
                   [[1 :i32 0]                       ; DATA_PAGE
                    [2 :i32 (count body)]            ; uncompressed_page_size
-                   [3 :i32 (count body)]            ; compressed_page_size
+                   [3 :i32 (count cbody)]           ; compressed_page_size
                    [5 :struct (th/encode-struct
                                [[1 :i32 n]          ; num_values INCLUDES nulls
                                 [2 :i32 (encoding-id :plain)]
                                 [3 :i32 (encoding-id :rle)]
                                 [4 :i32 (encoding-id :rle)]])]])]
-      {:bytes (into (vec header) body)
+      {:bytes (into (vec header) cbody)
+       :uncompressed (+ (count header) (count body))
        :num-values n
        :stats (cond-> {:nulls nulls}
                 (seq values)
                 (assoc :min (reduce (fn [a b] (if (neg? (compare b a)) b a)) values)
                        :max (reduce (fn [a b] (if (pos? (compare b a)) b a)) values)))})))
 
-(defn- column-meta [{:keys [name physical]} {:keys [num-values stats]} offset size]
+(defn- column-meta [{:keys [name physical]} {:keys [num-values stats uncompressed]}
+                    offset size codec]
   (th/encode-struct
    [[1 :i32 (physical-id physical)]
     [2 :list (th/encode-list :i32 [(encoding-id :plain) (encoding-id :rle)])]
     [3 :list (th/encode-list :binary [(th/string-bytes name)])]
-    [4 :i32 0]                                   ; UNCOMPRESSED
+    [4 :i32 (codec-id codec)]
     [5 :i64 num-values]
-    [6 :i64 size]                                ; total_uncompressed_size
+    [6 :i64 uncompressed]                        ; total_uncompressed_size
     [7 :i64 size]                                ; total_compressed_size
     [9 :i64 offset]                              ; data_page_offset
     [12 :struct (th/encode-struct
@@ -200,7 +231,7 @@
 
   `{:fields [{:name :physical :required?} ...] :batches [[col ...] ...]}` —
   one row group per batch, columns matching `:fields` in order."
-  [{:keys [fields batches]}]
+  [{:keys [fields batches codec] :or {codec :uncompressed}}]
   (doseq [{:keys [physical name]} fields]
     (when-not (contains? writable physical)
       (throw (ex-info (str "parquet: writing " (pr-str physical) " is not implemented")
@@ -214,10 +245,10 @@
             ;; describe them.
             [out' metas]
             (reduce (fn [[acc ms] [f c]]
-                      (let [chunk (column-chunk f c)
+                      (let [chunk (column-chunk f c codec)
                             at (count acc)]
                         [(into acc (:bytes chunk))
-                         (conj ms [(column-meta f chunk at (count (:bytes chunk))) at])]))
+                         (conj ms [(column-meta f chunk at (count (:bytes chunk)) codec) at])]))
                     [out []] (map vector fields cols))
             group (th/encode-struct
                    [[1 :list (th/encode-list
@@ -259,9 +290,14 @@
         (vec (concat out footer (le (count footer) 4) magic))))))
 
 (defn of-columns
-  "A single-row-group file from `[[name column] ...]`."
-  [named-cols]
-  (file {:fields (fields-of named-cols) :batches [(mapv second named-cols)]}))
+  "A single-row-group file from `[[name column] ...]`.
+
+  `codec` defaults to `:uncompressed`, which is what this writer did before it
+  could do anything else. Callers writing to object storage want `:snappy`."
+  ([named-cols] (of-columns named-cols :uncompressed))
+  ([named-cols codec]
+   (file {:fields (fields-of named-cols) :batches [(mapv second named-cols)]
+          :codec codec})))
 
 (defn columns-of-rows
   "Columns from `rows` (maps) for `named-types` (`[[name type] ...]`)."

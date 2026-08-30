@@ -48,6 +48,24 @@ EXPECTED = {
     "no-nulls": {"n": [1, 2, 3], "s": ["a", "bb", "ccc"]},
     "empty":    {"n": []},
     "unicode":  {"s": ["日本語", "", "aéb", None]},
+    "snappy": {
+        "price":  [10, 20, 30, 110, 120, 130, 210, 220, 230],
+        "region": ["east", "east", "west", "west", "east", "east", "east", "west", "west"],
+        "note":   [None, "clearance", None, None, None, "sale", None, None, None],
+        "ratio":  [1.5, 2.25, None, -0.5, 0.0, 3.75, None, 1.0, -2.5],
+    },
+    "snappy-repetitive": {
+        "s": ["the quick brown fox"] * 300,
+        "n": [42] * 300,
+    },
+}
+
+# Which cases must report which codec. A file that says SNAPPY and carries an
+# uncompressed body round-trips through a reader that ignores the field, so
+# the codec is asserted separately from the values.
+EXPECTED_CODEC = {
+    "snappy": "SNAPPY",
+    "snappy-repetitive": "SNAPPY",
 }
 
 ROW_GROUPS = {"three-row-groups": 3}
@@ -61,6 +79,18 @@ STATS = {
 }
 
 failures = []
+written = {p.stem for p in pathlib.Path(sys.argv[1]).glob("*.parquet")}
+unexpected = written - set(EXPECTED)
+if unexpected:
+    # A verifier that iterates its own expectations cannot see a file nobody
+    # asked about, and reports "all N accepted" while skipping it.
+    print(f"FAIL: {sorted(unexpected)} were written but have no expectation here")
+    sys.exit(1)
+missing = set(EXPECTED) - written
+if missing:
+    print(f"FAIL: {sorted(missing)} were expected but not written")
+    sys.exit(1)
+
 for name, expected in EXPECTED.items():
     path = out / f"{name}.parquet"
     try:
@@ -68,6 +98,20 @@ for name, expected in EXPECTED.items():
         table = f.read()
         # Walks offsets and buffer bounds rather than trusting the metadata.
         table.validate(full=True)
+
+        # The codec the file DECLARES, checked against what it should be. A
+        # file that says SNAPPY and carries an uncompressed body reads back
+        # perfectly through anything that ignores the field; pyarrow does not
+        # ignore it, so a mismatch here is caught by reading the values above
+        # -- and this assertion catches the reverse, a body we compressed
+        # under a file that still calls itself UNCOMPRESSED.
+        want_codec = EXPECTED_CODEC.get(name, "UNCOMPRESSED")
+        got_codecs = {f.metadata.row_group(g).column(c).compression
+                      for g in range(f.metadata.num_row_groups)
+                      for c in range(f.metadata.num_columns)}
+        if got_codecs and got_codecs != {want_codec}:
+            failures.append(f"{name}: codec {sorted(got_codecs)}, expected {want_codec}")
+            continue
 
         if name in ROW_GROUPS and f.num_row_groups != ROW_GROUPS[name]:
             failures.append(f"{name}: {f.num_row_groups} row groups, "
