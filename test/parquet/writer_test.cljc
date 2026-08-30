@@ -199,3 +199,19 @@
   (is (= :parquet/encoder-misuse
          (:type (try (th/encode-struct [[3 :i32 1] [1 :i32 2]])
                      (catch #?(:clj Exception :cljs :default) e (ex-data e)))))))
+
+(deftest snappy-pages-round-trip-and-are-smaller
+  (testing "the codec field and the body have to agree, and both have to change"
+    (let [cols [["s" (cvec/column :utf8 (vec (repeat 300 "the quick brown fox")))]
+                ["n" (cvec/column :int64 (vec (repeat 300 42)))]]
+          plain (w/of-columns cols :uncompressed)
+          snap (w/of-columns cols :snappy)]
+      (is (< (count snap) (/ (count plain) 5))
+          "repetitive columnar data is where snappy earns its place")
+      (testing "and our own reader gets the same values back"
+        (is (= (plan/scan (psrc/open plain) {:columns ["n"]})
+               (plan/scan (psrc/open snap) {:columns ["n"]})))))))
+
+(deftest an-unknown-codec-is-refused-rather-than-silently-uncompressed
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (w/of-columns [["n" (cvec/column :int64 [1 2 3])]] :zstd))))

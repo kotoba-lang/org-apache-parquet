@@ -50,7 +50,18 @@
 
    "empty" (w/of-columns [["n" (cvec/column :int64 [])]])
 
-   "unicode" (w/of-columns [["s" (cvec/column :utf8 ["日本語" "" "aéb" nil])]])})
+   "unicode" (w/of-columns [["s" (cvec/column :utf8 ["日本語" "" "aéb" nil])]])
+
+   ;; Snappy. The uncompressed cases above would all still pass if the codec
+   ;; field said SNAPPY and the body were not compressed, or the reverse --
+   ;; pyarrow is the only thing here that reads the field AND the bytes.
+   "snappy" (w/of-columns sample :snappy)
+   ;; Highly repetitive, so a reader that ignored the codec would produce
+   ;; visibly wrong values rather than coincidentally right ones.
+   "snappy-repetitive"
+   (w/of-columns [["s" (cvec/column :utf8 (vec (repeat 300 "the quick brown fox")))]
+                  ["n" (cvec/column :int64 (vec (repeat 300 42)))]]
+                 :snappy)})
 
 (defn -main [& [dir]]
   (doseq [[name bs] cases]

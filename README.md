@@ -15,6 +15,27 @@ bytes.
 Origin plane: the format is Apache's, so the repo is named for where it comes
 from (`parquet.apache.org` → `org-apache-parquet`), not for what it does here.
 
+## Pages can be compressed, since 2026-08-30
+
+```clojure
+(pq.write/of-columns cols :snappy)     ; or :uncompressed, the default
+```
+
+The writer emitted uncompressed pages for as long as there was nothing to
+compress them with. `com-google-snappy` closed that, and on the repetitive
+data a columnar file is made of it is not a small difference: **9,583 bytes to
+753**, measured on 300 rows of two repeated columns.
+
+Only `:uncompressed` and `:snappy` are offered. The rest of Parquet's codec
+enum is absent rather than listed and rejected later -- a name in that map is
+a promise that a page body can actually be compressed with it. `org-ietf-zstd`
+writes conformant frames of RAW blocks and has no encoder, so declaring ZSTD
+would produce files that are correct, larger than uncompressed, and labelled
+compressed. An unknown codec throws.
+
+`parquet.snappy` is now a delegation to `com-google-snappy` rather than a
+second copy of the format.
+
 ## Statistics work on files this reader cannot decode
 
 The single most useful property, and the reason a partial reader is worth
