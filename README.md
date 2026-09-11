@@ -241,7 +241,7 @@ make on its own.
 
 ```sh
 clojure -M:test                                          # JVM
-nbb --classpath "src:test:$(clojure -Spath)" test/run.cljs
+nbb --classpath "src:test:$(clojure -Spath)" test/run.cljk
 clojure -M:cljs -m cljs.main --target node -m parquet.cljs-runner
 clojure -M:lint
 ```

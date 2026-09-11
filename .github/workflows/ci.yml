@@ -21,7 +21,7 @@ jobs:
       # the JVM suite did not: Node Buffer pooling, a precision refusal raised
       # in the wrong layer, and int64 rounding past 2^53.
       - name: ClojureScript (nbb, interpreted)
-        run: nbb --classpath "src:test:$(clojure -Spath)" test/run.cljs
+        run: nbb --classpath "src:test:$(clojure -Spath)" test/run.cljk
       - name: ClojureScript (cljs.main, compiled)
         run: clojure -M:cljs -m cljs.main --target node -m parquet.cljs-runner
 
