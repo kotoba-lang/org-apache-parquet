@@ -240,10 +240,10 @@ make on its own.
 ## Test
 
 ```sh
-clojure -M:test                                          # JVM
-nbb --classpath "src:test:$(clojure -Spath)" test/run.cljk
-clojure -M:cljs -m cljs.main --target node -m parquet.cljs-runner
-clojure -M:lint
+kbb -M:test                                          # JVM
+kbb --backend sci --classpath "src:test:$(kbb -Spath)" test/run.cljk
+kbb -M:cljs -m cljs.main --target node -m parquet.cljs-runner
+kbb -M:lint
 ```
 
 All of them. The two ClojureScript runs found three real defects in this repo

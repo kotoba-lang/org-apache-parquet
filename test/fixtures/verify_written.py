@@ -1,6 +1,6 @@
 """Check that files THIS REPO wrote are valid Parquet, using the reference reader.
 
-    clojure -M:emit /tmp/parquet-out
+    kbb -M:emit /tmp/parquet-out
     .venv/bin/python test/fixtures/verify_written.py /tmp/parquet-out
 
 Why this exists as a separate step: "the writer produces valid Parquet" is a
